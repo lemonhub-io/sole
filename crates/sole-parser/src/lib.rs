@@ -1,0 +1,773 @@
+//! AST definitions and a recursive-descent parser for Sole.
+//!
+//! M1 scope: functions, top-level statements, let bindings, assignment,
+//! if/while/for, returns, and expressions. Grammar follows GOALS D1-D7.
+
+use sole_lexer::{Token, TokenKind};
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program {
+    pub items: Vec<Item>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Item {
+    Fn(FnDef),
+    Stmt(Stmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnDef {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Option<Type>,
+    pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub is_mut: bool,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Type {
+    Named(String, Vec<Type>),
+    Ref(Box<Type>),
+    MutRef(Box<Type>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub stmts: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Let {
+        name: String,
+        is_mut: bool,
+        ty: Option<Type>,
+        value: Expr,
+    },
+    Assign {
+        name: String,
+        value: Expr,
+    },
+    Expr(Expr),
+    Return(Option<Expr>),
+    If {
+        cond: Expr,
+        then_block: Block,
+        else_block: Option<ElseBranch>,
+    },
+    While {
+        cond: Expr,
+        body: Block,
+    },
+    For {
+        var: String,
+        is_mut: bool,
+        mode: IterMode,
+        iterable: Expr,
+        body: Block,
+    },
+    Break,
+    Continue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElseBranch {
+    If(Box<Stmt>),
+    Block(Block),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IterMode {
+    Move,
+    Borrow,
+    MutBorrow,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Bool(bool),
+    Ident(String),
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    Field {
+        obj: Box<Expr>,
+        name: String,
+    },
+    Index {
+        obj: Box<Expr>,
+        index: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnOp {
+    Neg,
+    Not,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseError {
+    pub message: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}: {}", self.line, self.column, self.message)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Lexes and parses a whole source file into a `Program`.
+pub fn parse(source: &str) -> Result<Program, ParseError> {
+    let tokens = sole_lexer::lex(source).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        column: e.column,
+    })?;
+    Parser::new(&tokens).parse_program()
+}
+
+struct Parser<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn new(tokens: &'a [Token]) -> Self {
+        Self { tokens, pos: 0 }
+    }
+
+    fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::Eof) {
+                break;
+            }
+            items.push(self.parse_item()?);
+        }
+        Ok(Program { items })
+    }
+
+    fn parse_item(&mut self) -> Result<Item, ParseError> {
+        if self.at(&TokenKind::Fn) {
+            return self.parse_fn().map(Item::Fn);
+        }
+        self.parse_stmt().map(Item::Stmt)
+    }
+
+    fn parse_fn(&mut self) -> Result<FnDef, ParseError> {
+        self.expect(&TokenKind::Fn, "`fn`")?;
+        let name = self.expect_ident("函数名")?;
+        self.expect(&TokenKind::LParen, "`(`")?;
+        let mut params = Vec::new();
+        if !self.at(&TokenKind::RParen) {
+            loop {
+                params.push(self.parse_param()?);
+                if self.at(&TokenKind::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)`")?;
+        let ret = if self.at(&TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Colon, "`:`")?;
+        self.expect(&TokenKind::Newline, "换行")?;
+        let body = self.parse_block()?;
+        Ok(FnDef {
+            name,
+            params,
+            ret,
+            body,
+        })
+    }
+
+    fn parse_param(&mut self) -> Result<Param, ParseError> {
+        let is_mut = self.at(&TokenKind::Mut);
+        if is_mut {
+            self.advance();
+        }
+        let name = self.expect_ident("参数名")?;
+        self.expect(&TokenKind::Colon, "参数类型标注 `:`")?;
+        let ty = self.parse_type()?;
+        Ok(Param { name, is_mut, ty })
+    }
+
+    fn parse_type(&mut self) -> Result<Type, ParseError> {
+        if self.at(&TokenKind::Mut) && self.peek2() == Some(&TokenKind::Ref) {
+            self.advance();
+            self.advance();
+            let inner = self.parse_type_inner()?;
+            return Ok(Type::MutRef(Box::new(inner)));
+        }
+        if self.at(&TokenKind::Ref) {
+            self.advance();
+            let inner = self.parse_type_inner()?;
+            return Ok(Type::Ref(Box::new(inner)));
+        }
+        self.parse_type_inner()
+    }
+
+    fn parse_type_inner(&mut self) -> Result<Type, ParseError> {
+        let name = self.expect_ident("类型名")?;
+        let mut args = Vec::new();
+        if self.at(&TokenKind::LBracket) {
+            self.advance();
+            loop {
+                args.push(self.parse_type()?);
+                if self.at(&TokenKind::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            self.expect(&TokenKind::RBracket, "`]`")?;
+        }
+        Ok(Type::Named(name, args))
+    }
+
+    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        match self.peek_kind() {
+            Some(TokenKind::Let) => self.parse_let(),
+            Some(TokenKind::Ident(_)) if self.peek2() == Some(&TokenKind::Eq) => {
+                self.parse_assign()
+            }
+            Some(TokenKind::Return) => self.parse_return(),
+            Some(TokenKind::If) => self.parse_if(),
+            Some(TokenKind::While) => self.parse_while(),
+            Some(TokenKind::For) => self.parse_for(),
+            Some(TokenKind::Break) => {
+                self.advance();
+                self.expect_stmt_end()?;
+                Ok(Stmt::Break)
+            }
+            Some(TokenKind::Continue) => {
+                self.advance();
+                self.expect_stmt_end()?;
+                Ok(Stmt::Continue)
+            }
+            _ => {
+                let expr = self.parse_expr()?;
+                self.expect_stmt_end()?;
+                Ok(Stmt::Expr(expr))
+            }
+        }
+    }
+
+    fn parse_let(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::Let, "`let`")?;
+        let is_mut = self.at(&TokenKind::Mut);
+        if is_mut {
+            self.advance();
+        }
+        let name = self.expect_ident("变量名")?;
+        let ty = if self.at(&TokenKind::Colon) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let value = self.parse_expr()?;
+        self.expect_stmt_end()?;
+        Ok(Stmt::Let {
+            name,
+            is_mut,
+            ty,
+            value,
+        })
+    }
+
+    fn parse_assign(&mut self) -> Result<Stmt, ParseError> {
+        let name = self.expect_ident("变量名")?;
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let value = self.parse_expr()?;
+        self.expect_stmt_end()?;
+        Ok(Stmt::Assign { name, value })
+    }
+
+    fn parse_return(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::Return, "`return`")?;
+        let value = match self.peek_kind() {
+            Some(TokenKind::Newline) | Some(TokenKind::Eof) => None,
+            _ => Some(self.parse_expr()?),
+        };
+        self.expect_stmt_end()?;
+        Ok(Stmt::Return(value))
+    }
+
+    fn parse_if(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::If, "`if`")?;
+        let cond = self.parse_expr()?;
+        self.expect(&TokenKind::Colon, "`:`")?;
+        self.expect(&TokenKind::Newline, "换行")?;
+        let then_block = self.parse_block()?;
+        let else_block = if self.at(&TokenKind::Else) {
+            self.advance();
+            if self.at(&TokenKind::If) {
+                Some(ElseBranch::If(Box::new(self.parse_if()?)))
+            } else {
+                self.expect(&TokenKind::Colon, "`:`")?;
+                self.expect(&TokenKind::Newline, "换行")?;
+                let block = self.parse_block()?;
+                Some(ElseBranch::Block(block))
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If {
+            cond,
+            then_block,
+            else_block,
+        })
+    }
+
+    fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::While, "`while`")?;
+        let cond = self.parse_expr()?;
+        self.expect(&TokenKind::Colon, "`:`")?;
+        self.expect(&TokenKind::Newline, "换行")?;
+        let body = self.parse_block()?;
+        Ok(Stmt::While { cond, body })
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::For, "`for`")?;
+        let is_mut = self.at(&TokenKind::Mut);
+        if is_mut {
+            self.advance();
+        }
+        let var = self.expect_ident("循环变量")?;
+        self.expect(&TokenKind::In, "`in`")?;
+        let mode = if self.at(&TokenKind::Mut) && self.peek2() == Some(&TokenKind::Ref) {
+            self.advance();
+            self.advance();
+            IterMode::MutBorrow
+        } else if self.at(&TokenKind::Ref) {
+            self.advance();
+            IterMode::Borrow
+        } else {
+            IterMode::Move
+        };
+        let iterable = self.parse_expr()?;
+        self.expect(&TokenKind::Colon, "`:`")?;
+        self.expect(&TokenKind::Newline, "换行")?;
+        let body = self.parse_block()?;
+        Ok(Stmt::For {
+            var,
+            is_mut,
+            mode,
+            iterable,
+            body,
+        })
+    }
+
+    /// Parses an indented block. The caller must already have consumed
+    /// the `:` and the newline.
+    fn parse_block(&mut self) -> Result<Block, ParseError> {
+        self.expect(&TokenKind::Indent, "缩进块")?;
+        let mut stmts = Vec::new();
+        while !self.at(&TokenKind::Dedent) {
+            if self.at(&TokenKind::Eof) {
+                return Err(self.error_here("块未闭合: 期望 DEDENT"));
+            }
+            stmts.push(self.parse_stmt()?);
+        }
+        self.advance(); // consume Dedent
+        Ok(Block { stmts })
+    }
+
+    fn expect_stmt_end(&mut self) -> Result<(), ParseError> {
+        match self.peek_kind() {
+            Some(TokenKind::Newline) => {
+                self.advance();
+                Ok(())
+            }
+            Some(TokenKind::Eof) => Ok(()),
+            _ => Err(self.error_here("期望语句结束(换行)")),
+        }
+    }
+
+    // Expression parsing, lowest precedence first.
+
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_and()?;
+        while self.at(&TokenKind::Or) {
+            self.advance();
+            let rhs = self.parse_and()?;
+            lhs = Expr::Binary {
+                op: BinOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_cmp()?;
+        while self.at(&TokenKind::And) {
+            self.advance();
+            let rhs = self.parse_cmp()?;
+            lhs = Expr::Binary {
+                op: BinOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op = match self.peek_kind() {
+                Some(TokenKind::EqEq) => BinOp::Eq,
+                Some(TokenKind::BangEq) => BinOp::Ne,
+                Some(TokenKind::Lt) => BinOp::Lt,
+                Some(TokenKind::Le) => BinOp::Le,
+                Some(TokenKind::Gt) => BinOp::Gt,
+                Some(TokenKind::Ge) => BinOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_add()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_add(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_mul()?;
+        loop {
+            let op = match self.peek_kind() {
+                Some(TokenKind::Plus) => BinOp::Add,
+                Some(TokenKind::Minus) => BinOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_mul()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_mul(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let op = match self.peek_kind() {
+                Some(TokenKind::Star) => BinOp::Mul,
+                Some(TokenKind::Slash) => BinOp::Div,
+                Some(TokenKind::Percent) => BinOp::Mod,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_unary()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        match self.peek_kind() {
+            Some(TokenKind::Minus) => {
+                self.advance();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(expr),
+                })
+            }
+            Some(TokenKind::Not) => {
+                self.advance();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(expr),
+                })
+            }
+            _ => self.parse_postfix(),
+        }
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            match self.peek_kind() {
+                Some(TokenKind::LParen) => {
+                    self.advance();
+                    let mut args = Vec::new();
+                    if !self.at(&TokenKind::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.at(&TokenKind::Comma) {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen, "`)`")?;
+                    expr = Expr::Call {
+                        callee: Box::new(expr),
+                        args,
+                    };
+                }
+                Some(TokenKind::LBracket) => {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    self.expect(&TokenKind::RBracket, "`]`")?;
+                    expr = Expr::Index {
+                        obj: Box::new(expr),
+                        index: Box::new(index),
+                    };
+                }
+                Some(TokenKind::Dot) => {
+                    self.advance();
+                    let name = self.expect_ident("字段名")?;
+                    expr = Expr::Field {
+                        obj: Box::new(expr),
+                        name,
+                    };
+                }
+                _ => break,
+            }
+        }
+        Ok(expr)
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        match self.peek_kind() {
+            Some(TokenKind::Int(n)) => {
+                self.advance();
+                Ok(Expr::Int(n))
+            }
+            Some(TokenKind::Float(f)) => {
+                self.advance();
+                Ok(Expr::Float(f))
+            }
+            Some(TokenKind::Str(s)) => {
+                let s = s.clone();
+                self.advance();
+                Ok(Expr::Str(s))
+            }
+            Some(TokenKind::True) => {
+                self.advance();
+                Ok(Expr::Bool(true))
+            }
+            Some(TokenKind::False) => {
+                self.advance();
+                Ok(Expr::Bool(false))
+            }
+            Some(TokenKind::Ident(name)) => {
+                let name = name.clone();
+                self.advance();
+                Ok(Expr::Ident(name))
+            }
+            Some(TokenKind::LParen) => {
+                self.advance();
+                let inner = self.parse_expr()?;
+                self.expect(&TokenKind::RParen, "`)`")?;
+                Ok(inner)
+            }
+            _ => Err(self.error_here("期望表达式")),
+        }
+    }
+
+    // Token stream helpers.
+
+    fn peek_kind(&self) -> Option<TokenKind> {
+        self.tokens.get(self.pos).map(|t| t.kind.clone())
+    }
+
+    fn at(&self, kind: &TokenKind) -> bool {
+        self.peek_kind().as_ref() == Some(kind)
+    }
+
+    fn peek2(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + 1).map(|t| &t.kind)
+    }
+
+    fn advance(&mut self) {
+        if self.pos < self.tokens.len() {
+            self.pos += 1;
+        }
+    }
+
+    fn expect(&mut self, kind: &TokenKind, what: &str) -> Result<(), ParseError> {
+        if self.at(kind) {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.error_here(&format!("期望 {}", what)))
+        }
+    }
+
+    fn expect_ident(&mut self, what: &str) -> Result<String, ParseError> {
+        match self.peek_kind() {
+            Some(TokenKind::Ident(name)) => {
+                let name = name.clone();
+                self.advance();
+                Ok(name)
+            }
+            _ => Err(self.error_here(&format!("期望{}", what))),
+        }
+    }
+
+    fn skip_newlines(&mut self) {
+        while self.at(&TokenKind::Newline) {
+            self.advance();
+        }
+    }
+
+    fn error_here(&self, message: &str) -> ParseError {
+        let (line, column) = match self.tokens.get(self.pos) {
+            Some(t) => (t.line, t.column),
+            None => (0, 0),
+        };
+        ParseError {
+            message: message.to_string(),
+            line,
+            column,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_fn_with_types_and_generics() {
+        let p = parse("fn add(a: int, b: List[int]) -> int:\n    return a\n").expect("parse");
+        assert_eq!(p.items.len(), 1);
+        let Item::Fn(f) = &p.items[0] else {
+            panic!("expected fn item");
+        };
+        assert_eq!(f.name, "add");
+        assert_eq!(f.params.len(), 2);
+        assert_eq!(f.ret, Some(Type::Named("int".into(), vec![])));
+    }
+
+    #[test]
+    fn parses_ref_types() {
+        let p = parse("fn peek(x: ref List[int]) -> int:\n    return 0\n").expect("parse");
+        let Item::Fn(f) = &p.items[0] else {
+            panic!("expected fn item");
+        };
+        assert_eq!(
+            f.params[0].ty,
+            Type::Ref(Box::new(Type::Named("List".into(), vec![Type::Named(
+                "int".into(),
+                vec![]
+            )])))
+        );
+    }
+
+    #[test]
+    fn parses_top_level_statements_and_control_flow() {
+        let src = r#"
+let mut total = 0
+for i in range(5):
+    total = total + i
+while total > 0:
+    total = total - 1
+print(total)
+"#;
+        let p = parse(src).expect("parse");
+        assert!(p.items.len() >= 4);
+    }
+
+    #[test]
+    fn parses_if_else_chain() {
+        let src = r#"
+fn sign(n: int) -> str:
+    if n > 0:
+        return "pos"
+    else if n < 0:
+        return "neg"
+    else:
+        return "zero"
+"#;
+        let p = parse(src).expect("parse");
+        let Item::Fn(f) = &p.items[0] else {
+            panic!("expected fn item");
+        };
+        assert_eq!(f.name, "sign");
+    }
+
+    #[test]
+    fn rejects_missing_indent() {
+        assert!(parse("fn f():\nreturn 1\n").is_err());
+    }
+
+    #[test]
+    fn assignment_requires_target_ident() {
+        assert!(parse("x + 1 = 5\n").is_err());
+    }
+}

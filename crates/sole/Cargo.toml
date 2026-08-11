@@ -1,0 +1,13 @@
+[package]
+name = "sole"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sole-lexer = { path = "../sole-lexer" }
+sole-parser = { path = "../sole-parser" }
+
+[[bin]]
+name = "sole"
+path = "src/main.rs"
