@@ -1,37 +1,75 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("run") => {
-            let Some(path) = args.get(2) else {
-                eprintln!("用法: sole run <文件>");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut lang: Option<sole::Lang> = None;
+    let mut command: Option<(&str, Option<&str>)> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--lang" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("error: `--lang` requires a value (en | zh)");
+                    return ExitCode::from(2);
+                };
+                match sole::Lang::parse(value) {
+                    Some(l) => {
+                        lang = Some(l);
+                        i += 2;
+                    }
+                    None => {
+                        eprintln!(
+                            "error: unknown language `{}` (supported: en, zh)",
+                            value
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "run" => {
+                let path = args.get(i + 1).map(String::as_str);
+                command = Some(("run", path));
+                i += 2;
+            }
+            "--version" | "-V" => {
+                println!("sole {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("error: unknown argument `{}`", other);
                 return ExitCode::from(2);
-            };
+            }
+        }
+    }
+    if let Some(l) = lang {
+        sole::set_lang(l);
+    }
+    match command {
+        Some(("run", Some(path))) => {
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("无法读取 {}: {}", path, e);
+                    eprintln!("error: cannot read {}: {}", path, e);
                     return ExitCode::from(2);
                 }
             };
             match sole::run_source(&source) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(msg) => {
-                    eprintln!("错误: {}", msg);
+                    eprintln!("error: {}", msg);
                     ExitCode::from(1)
                 }
             }
         }
-        Some("--version") | Some("-V") => {
-            println!("sole {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
         _ => {
-            eprintln!("Sole {} — AI 友好的编程语言", env!("CARGO_PKG_VERSION"));
-            eprintln!("用法:");
-            eprintln!("  sole run <文件>   运行 .sole 脚本");
-            eprintln!("  sole --version    显示版本");
+            eprintln!(
+                "Sole {} — an AI-friendly programming language",
+                env!("CARGO_PKG_VERSION")
+            );
+            eprintln!("usage:");
+            eprintln!("  sole run [--lang en|zh] <file>    run a .sole script");
+            eprintln!("  sole --version                    print version");
+            eprintln!("(error messages default to English; SOLE_LANG env var also works)");
             ExitCode::from(2)
         }
     }

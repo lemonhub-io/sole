@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/sole-diag",
     "crates/sole-lexer",
     "crates/sole-parser",
     "crates/sole",

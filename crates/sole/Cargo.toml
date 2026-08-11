@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sole-diag = { path = "../sole-diag" }
 sole-lexer = { path = "../sole-lexer" }
 sole-parser = { path = "../sole-parser" }
 

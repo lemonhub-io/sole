@@ -19,8 +19,11 @@
 ```sh
 cargo run --bin sole -- run examples/hello.sole
 cargo run --bin sole -- run examples/fib.sole
+cargo run --bin sole -- run --lang zh examples/hello.sole   # 错误信息中文
 cargo test --workspace
 ```
+
+错误信息默认英文(带稳定错误码,如 `[E0201]`),用 `--lang zh` 或环境变量 `SOLE_LANG=zh` 切换中文。
 
 ## 开发工作流
 

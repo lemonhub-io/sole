@@ -3,6 +3,7 @@
 //! M1 scope: functions, top-level statements, let bindings, assignment,
 //! if/while/for, returns, and expressions. Grammar follows GOALS D1-D7.
 
+use sole_diag::{Diagnostic, IdentKind, Lang, Msg};
 use sole_lexer::{Token, TokenKind};
 use std::fmt;
 
@@ -146,14 +147,12 @@ pub enum BinOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
-    pub message: String,
-    pub line: usize,
-    pub column: usize,
+    pub diag: Diagnostic,
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.line, self.column, self.message)
+        write!(f, "{}", self.diag.render(Lang::current()))
     }
 }
 
@@ -161,11 +160,7 @@ impl std::error::Error for ParseError {}
 
 /// Lexes and parses a whole source file into a `Program`.
 pub fn parse(source: &str) -> Result<Program, ParseError> {
-    let tokens = sole_lexer::lex(source).map_err(|e| ParseError {
-        message: e.message,
-        line: e.line,
-        column: e.column,
-    })?;
+    let tokens = sole_lexer::lex(source).map_err(|e| ParseError { diag: e.diag })?;
     Parser::new(&tokens).parse_program()
 }
 
@@ -199,9 +194,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_fn(&mut self) -> Result<FnDef, ParseError> {
-        self.expect(&TokenKind::Fn, "`fn`")?;
-        let name = self.expect_ident("函数名")?;
-        self.expect(&TokenKind::LParen, "`(`")?;
+        self.expect(&TokenKind::Fn, "fn")?;
+        let name = self.expect_ident(IdentKind::FnName)?;
+        self.expect(&TokenKind::LParen, "(")?;
         let mut params = Vec::new();
         if !self.at(&TokenKind::RParen) {
             loop {
@@ -213,15 +208,15 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.expect(&TokenKind::RParen, "`)`")?;
+        self.expect(&TokenKind::RParen, ")")?;
         let ret = if self.at(&TokenKind::Arrow) {
             self.advance();
             Some(self.parse_type()?)
         } else {
             None
         };
-        self.expect(&TokenKind::Colon, "`:`")?;
-        self.expect(&TokenKind::Newline, "换行")?;
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
         let body = self.parse_block()?;
         Ok(FnDef {
             name,
@@ -236,8 +231,8 @@ impl<'a> Parser<'a> {
         if is_mut {
             self.advance();
         }
-        let name = self.expect_ident("参数名")?;
-        self.expect(&TokenKind::Colon, "参数类型标注 `:`")?;
+        let name = self.expect_ident(IdentKind::ParamName)?;
+        self.expect(&TokenKind::Colon, ":")?;
         let ty = self.parse_type()?;
         Ok(Param { name, is_mut, ty })
     }
@@ -258,7 +253,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_inner(&mut self) -> Result<Type, ParseError> {
-        let name = self.expect_ident("类型名")?;
+        let name = self.expect_ident(IdentKind::TypeName)?;
         let mut args = Vec::new();
         if self.at(&TokenKind::LBracket) {
             self.advance();
@@ -270,7 +265,7 @@ impl<'a> Parser<'a> {
                 }
                 break;
             }
-            self.expect(&TokenKind::RBracket, "`]`")?;
+            self.expect(&TokenKind::RBracket, "]")?;
         }
         Ok(Type::Named(name, args))
     }
@@ -304,19 +299,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_let(&mut self) -> Result<Stmt, ParseError> {
-        self.expect(&TokenKind::Let, "`let`")?;
+        self.expect(&TokenKind::Let, "let")?;
         let is_mut = self.at(&TokenKind::Mut);
         if is_mut {
             self.advance();
         }
-        let name = self.expect_ident("变量名")?;
+        let name = self.expect_ident(IdentKind::VarName)?;
         let ty = if self.at(&TokenKind::Colon) {
             self.advance();
             Some(self.parse_type()?)
         } else {
             None
         };
-        self.expect(&TokenKind::Eq, "`=`")?;
+        self.expect(&TokenKind::Eq, "=")?;
         let value = self.parse_expr()?;
         self.expect_stmt_end()?;
         Ok(Stmt::Let {
@@ -328,15 +323,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assign(&mut self) -> Result<Stmt, ParseError> {
-        let name = self.expect_ident("变量名")?;
-        self.expect(&TokenKind::Eq, "`=`")?;
+        let name = self.expect_ident(IdentKind::VarName)?;
+        self.expect(&TokenKind::Eq, "=")?;
         let value = self.parse_expr()?;
         self.expect_stmt_end()?;
         Ok(Stmt::Assign { name, value })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, ParseError> {
-        self.expect(&TokenKind::Return, "`return`")?;
+        self.expect(&TokenKind::Return, "return")?;
         let value = match self.peek_kind() {
             Some(TokenKind::Newline) | Some(TokenKind::Eof) => None,
             _ => Some(self.parse_expr()?),
@@ -346,18 +341,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_if(&mut self) -> Result<Stmt, ParseError> {
-        self.expect(&TokenKind::If, "`if`")?;
+        self.expect(&TokenKind::If, "if")?;
         let cond = self.parse_expr()?;
-        self.expect(&TokenKind::Colon, "`:`")?;
-        self.expect(&TokenKind::Newline, "换行")?;
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
         let then_block = self.parse_block()?;
         let else_block = if self.at(&TokenKind::Else) {
             self.advance();
             if self.at(&TokenKind::If) {
                 Some(ElseBranch::If(Box::new(self.parse_if()?)))
             } else {
-                self.expect(&TokenKind::Colon, "`:`")?;
-                self.expect(&TokenKind::Newline, "换行")?;
+                self.expect(&TokenKind::Colon, ":")?;
+                self.expect_newline()?;
                 let block = self.parse_block()?;
                 Some(ElseBranch::Block(block))
             }
@@ -372,22 +367,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
-        self.expect(&TokenKind::While, "`while`")?;
+        self.expect(&TokenKind::While, "while")?;
         let cond = self.parse_expr()?;
-        self.expect(&TokenKind::Colon, "`:`")?;
-        self.expect(&TokenKind::Newline, "换行")?;
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
         let body = self.parse_block()?;
         Ok(Stmt::While { cond, body })
     }
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
-        self.expect(&TokenKind::For, "`for`")?;
+        self.expect(&TokenKind::For, "for")?;
         let is_mut = self.at(&TokenKind::Mut);
         if is_mut {
             self.advance();
         }
-        let var = self.expect_ident("循环变量")?;
-        self.expect(&TokenKind::In, "`in`")?;
+        let var = self.expect_ident(IdentKind::LoopVar)?;
+        self.expect(&TokenKind::In, "in")?;
         let mode = if self.at(&TokenKind::Mut) && self.peek2() == Some(&TokenKind::Ref) {
             self.advance();
             self.advance();
@@ -399,8 +394,8 @@ impl<'a> Parser<'a> {
             IterMode::Move
         };
         let iterable = self.parse_expr()?;
-        self.expect(&TokenKind::Colon, "`:`")?;
-        self.expect(&TokenKind::Newline, "换行")?;
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
         let body = self.parse_block()?;
         Ok(Stmt::For {
             var,
@@ -414,11 +409,15 @@ impl<'a> Parser<'a> {
     /// Parses an indented block. The caller must already have consumed
     /// the `:` and the newline.
     fn parse_block(&mut self) -> Result<Block, ParseError> {
-        self.expect(&TokenKind::Indent, "缩进块")?;
+        if self.at(&TokenKind::Indent) {
+            self.advance();
+        } else {
+            return Err(self.err_here(Msg::ExpectedIndent));
+        }
         let mut stmts = Vec::new();
         while !self.at(&TokenKind::Dedent) {
             if self.at(&TokenKind::Eof) {
-                return Err(self.error_here("块未闭合: 期望 DEDENT"));
+                return Err(self.err_here(Msg::BlockNotClosed));
             }
             stmts.push(self.parse_stmt()?);
         }
@@ -433,7 +432,7 @@ impl<'a> Parser<'a> {
                 Ok(())
             }
             Some(TokenKind::Eof) => Ok(()),
-            _ => Err(self.error_here("期望语句结束(换行)")),
+            _ => Err(self.err_here(Msg::ExpectedNewline)),
         }
     }
 
@@ -572,7 +571,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    self.expect(&TokenKind::RParen, "`)`")?;
+                    self.expect(&TokenKind::RParen, ")")?;
                     expr = Expr::Call {
                         callee: Box::new(expr),
                         args,
@@ -581,7 +580,7 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::LBracket) => {
                     self.advance();
                     let index = self.parse_expr()?;
-                    self.expect(&TokenKind::RBracket, "`]`")?;
+                    self.expect(&TokenKind::RBracket, "]")?;
                     expr = Expr::Index {
                         obj: Box::new(expr),
                         index: Box::new(index),
@@ -589,7 +588,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(TokenKind::Dot) => {
                     self.advance();
-                    let name = self.expect_ident("字段名")?;
+                    let name = self.expect_ident(IdentKind::FieldName)?;
                     expr = Expr::Field {
                         obj: Box::new(expr),
                         name,
@@ -632,10 +631,10 @@ impl<'a> Parser<'a> {
             Some(TokenKind::LParen) => {
                 self.advance();
                 let inner = self.parse_expr()?;
-                self.expect(&TokenKind::RParen, "`)`")?;
+                self.expect(&TokenKind::RParen, ")")?;
                 Ok(inner)
             }
-            _ => Err(self.error_here("期望表达式")),
+            _ => Err(self.err_here(Msg::ExpectedExpr)),
         }
     }
 
@@ -659,23 +658,32 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect(&mut self, kind: &TokenKind, what: &str) -> Result<(), ParseError> {
+    fn expect(&mut self, kind: &TokenKind, token: &str) -> Result<(), ParseError> {
         if self.at(kind) {
             self.advance();
             Ok(())
         } else {
-            Err(self.error_here(&format!("期望 {}", what)))
+            Err(self.err_here(Msg::ExpectedToken(token.to_string())))
         }
     }
 
-    fn expect_ident(&mut self, what: &str) -> Result<String, ParseError> {
+    fn expect_newline(&mut self) -> Result<(), ParseError> {
+        if self.at(&TokenKind::Newline) {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.err_here(Msg::ExpectedNewline))
+        }
+    }
+
+    fn expect_ident(&mut self, kind: IdentKind) -> Result<String, ParseError> {
         match self.peek_kind() {
             Some(TokenKind::Ident(name)) => {
                 let name = name.clone();
                 self.advance();
                 Ok(name)
             }
-            _ => Err(self.error_here(&format!("期望{}", what))),
+            _ => Err(self.err_here(Msg::ExpectedIdent(kind))),
         }
     }
 
@@ -685,15 +693,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn error_here(&self, message: &str) -> ParseError {
+    fn err_here(&self, msg: Msg) -> ParseError {
         let (line, column) = match self.tokens.get(self.pos) {
             Some(t) => (t.line, t.column),
             None => (0, 0),
         };
         ParseError {
-            message: message.to_string(),
-            line,
-            column,
+            diag: Diagnostic::new(msg, line, column),
         }
     }
 }

@@ -4,9 +4,8 @@
 //! things small: values, a scope-based environment with mutability tracking,
 //! and a small set of builtins (`print`, `range`).
 
-use sole_parser::{
-    BinOp, Block, ElseBranch, Expr, FnDef, Item, Program, Stmt, UnOp,
-};
+use sole_diag::{Diagnostic, Lang, Msg};
+use sole_parser::{BinOp, Block, ElseBranch, Expr, FnDef, Item, Program, Stmt, UnOp};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -27,18 +26,24 @@ pub struct Binding {
     pub mutable: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvalError {
-    pub message: String,
+    pub diag: Diagnostic,
 }
 
 impl std::fmt::Display for EvalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}", self.diag.render(Lang::current()))
     }
 }
 
 impl std::error::Error for EvalError {}
+
+fn err(msg: Msg) -> EvalError {
+    EvalError {
+        diag: Diagnostic::new(msg, 0, 0),
+    }
+}
 
 struct Env {
     global: HashMap<String, Binding>,
@@ -83,16 +88,12 @@ impl Env {
         if let Some(b) = self.global.get_mut(name) {
             return Self::set_binding(b, name, value);
         }
-        Err(EvalError {
-            message: format!("未定义变量 `{}`", name),
-        })
+        Err(err(Msg::UndefinedVariable(name.to_string())))
     }
 
     fn set_binding(b: &mut Binding, name: &str, value: Value) -> Result<(), EvalError> {
         if !b.mutable {
-            return Err(EvalError {
-                message: format!("不可变绑定 `{}` 不能重新赋值(声明为 `let mut`)", name),
-            });
+            return Err(err(Msg::ImmutableReassign(name.to_string())));
         }
         b.value = value;
         Ok(())
@@ -218,12 +219,7 @@ fn eval_stmt(
                     }
                 }
                 other => {
-                    return Err(EvalError {
-                        message: format!(
-                            "`for` 暂仅支持 Range(集合/通道见 GOALS D6/§7);得到 {:?}",
-                            other
-                        ),
-                    });
+                    return Err(err(Msg::ForNotSupported(format_value(&other))));
                 }
             }
             Ok(Flow::Next)
@@ -259,8 +255,8 @@ fn eval_expr(
         Expr::Float(f) => Ok(Value::Float(*f)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
-        Expr::Ident(name) => env.lookup(name).ok_or_else(|| EvalError {
-            message: format!("未定义变量 `{}`", name),
+        Expr::Ident(name) => env.lookup(name).ok_or_else(|| {
+            err(Msg::UndefinedVariable(name.clone()))
         }),
         Expr::Unary { op, expr } => {
             let v = eval_expr(expr, program, env, &mut *out)?;
@@ -268,9 +264,7 @@ fn eval_expr(
                 UnOp::Neg => match v {
                     Value::Int(n) => Ok(Value::Int(-n)),
                     Value::Float(f) => Ok(Value::Float(-f)),
-                    _ => Err(EvalError {
-                        message: "一元 `-` 仅支持数值".into(),
-                    }),
+                    _ => Err(err(Msg::NotNegatable)),
                 },
                 UnOp::Not => Ok(Value::Bool(!truthy(&v)?)),
             }
@@ -310,23 +304,15 @@ fn eval_expr(
                 Value::Fn(idx) => {
                     let item = &program.items[idx];
                     let Item::Fn(fdef) = item else {
-                        return Err(EvalError {
-                            message: "内部错误: 函数索引无效".into(),
-                        });
+                        return Err(err(Msg::InternalFnIndex));
                     };
                     call_fn(fdef, args, program, env, &mut *out)
                 }
-                other => Err(EvalError {
-                    message: format!("无法调用 {:?}", other),
-                }),
+                other => Err(err(Msg::BadCall(format_value(&other)))),
             }
         }
-        Expr::Field { .. } => Err(EvalError {
-            message: "字段访问尚未实现 (M1)".into(),
-        }),
-        Expr::Index { .. } => Err(EvalError {
-            message: "下标访问尚未实现 (M1)".into(),
-        }),
+        Expr::Field { .. } => Err(err(Msg::FieldNotImplemented)),
+        Expr::Index { .. } => Err(err(Msg::IndexNotImplemented)),
     }
 }
 
@@ -338,14 +324,11 @@ fn call_fn(
     out: &mut dyn Write,
 ) -> Result<Value, EvalError> {
     if args.len() != fdef.params.len() {
-        return Err(EvalError {
-            message: format!(
-                "函数 `{}` 期望 {} 个参数,实际 {} 个",
-                fdef.name,
-                fdef.params.len(),
-                args.len()
-            ),
-        });
+        return Err(err(Msg::ArgCount(
+            fdef.name.clone(),
+            fdef.params.len(),
+            args.len(),
+        )));
     }
     let mut arg_values = Vec::new();
     for a in args {
@@ -382,7 +365,7 @@ fn call_builtin(
                 parts.push(format_value(&v));
             }
             writeln!(out, "{}", parts.join(" "))
-                .map_err(|e| EvalError { message: e.to_string() })?;
+                .map_err(|e| err(Msg::Io(e.to_string())))?;
             Ok(Some(Value::Unit))
         }
         "range" => {
@@ -390,21 +373,13 @@ fn call_builtin(
             for a in args {
                 match eval_expr(a, program, env, &mut *out)? {
                     Value::Int(n) => nums.push(n),
-                    _ => {
-                        return Err(EvalError {
-                            message: "`range` 参数必须是整数".into(),
-                        });
-                    }
+                    _ => return Err(err(Msg::RangeNotInt)),
                 }
             }
             let (start, end) = match nums.as_slice() {
                 [end] => (0, *end),
                 [start, end] => (*start, *end),
-                _ => {
-                    return Err(EvalError {
-                        message: "`range` 期望 1 或 2 个参数".into(),
-                    });
-                }
+                _ => return Err(err(Msg::RangeArgCount)),
             };
             Ok(Some(Value::Range { start, end }))
         }
@@ -422,17 +397,13 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
                 Mul => Ok(Value::Int(a.wrapping_mul(b))),
                 Div => {
                     if b == 0 {
-                        return Err(EvalError {
-                            message: "整数除以零".into(),
-                        });
+                        return Err(err(Msg::DivByZero));
                     }
                     Ok(Value::Int(a / b))
                 }
                 Mod => {
                     if b == 0 {
-                        return Err(EvalError {
-                            message: "整数取模除零".into(),
-                        });
+                        return Err(err(Msg::ModByZero));
                     }
                     Ok(Value::Int(a % b))
                 }
@@ -444,9 +415,7 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
             (Value::Str(a), Value::Str(b)) if op == Add => {
                 Ok(Value::Str(format!("{}{}", a, b)))
             }
-            _ => Err(EvalError {
-                message: "运算符类型不匹配".into(),
-            }),
+            _ => Err(err(Msg::TypeMismatch)),
         },
         Eq | Ne | Lt | Le | Gt | Ge => cmp_op(op, &l, &r),
         And | Or => unreachable!("handled in eval_expr"),
@@ -495,17 +464,9 @@ fn cmp_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (Value::Bool(a), Value::Bool(b)) => match op {
             Eq => a == b,
             Ne => a != b,
-            _ => {
-                return Err(EvalError {
-                    message: "布尔值仅支持相等比较".into(),
-                });
-            }
+            _ => return Err(err(Msg::BoolOrderCmp)),
         },
-        _ => {
-            return Err(EvalError {
-                message: "比较运算符类型不匹配".into(),
-            });
-        }
+        _ => return Err(err(Msg::CmpMismatch)),
     };
     Ok(Value::Bool(result))
 }
@@ -529,9 +490,7 @@ fn truthy(v: &Value) -> Result<bool, EvalError> {
         Value::Int(n) => Ok(*n != 0),
         Value::Float(f) => Ok(*f != 0.0),
         Value::Str(s) => Ok(!s.is_empty()),
-        _ => Err(EvalError {
-            message: "该值不能用作条件".into(),
-        }),
+        _ => Err(err(Msg::BadCondition)),
     }
 }
 

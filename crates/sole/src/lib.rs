@@ -5,7 +5,14 @@
 
 pub mod eval;
 
+pub use sole_diag::Lang;
+
 use sole_parser::parse;
+
+/// Overrides the effective error-message language for this process.
+pub fn set_lang(lang: Lang) {
+    sole_diag::set_override(Some(lang));
+}
 
 /// Runs Sole source code end-to-end: lex → parse → evaluate.
 pub fn run_source(source: &str) -> Result<(), String> {

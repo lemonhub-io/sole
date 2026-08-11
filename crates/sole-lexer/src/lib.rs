@@ -5,6 +5,7 @@
 //! anywhere in the source (GOALS D1: mixing tabs and spaces is a compile
 //! error).
 
+use sole_diag::{Diagnostic, Lang, Msg};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,14 +84,12 @@ impl Token {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LexError {
-    pub message: String,
-    pub line: usize,
-    pub column: usize,
+    pub diag: Diagnostic,
 }
 
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.line, self.column, self.message)
+        write!(f, "{}", self.diag.render(Lang::current()))
     }
 }
 
@@ -144,7 +143,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                 }
                 Some(b'\t') => {
-                    return Err(self.error("tab 字符不允许(混用 Tab/空格是编译错误,见 GOALS D1)"));
+                    return Err(self.error(Msg::TabNotAllowed));
                 }
                 Some(b'#') => {
                     while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
@@ -180,7 +179,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                 }
                 b'\t' => {
-                    return Err(self.error("行首出现 tab: 混用 Tab/空格是编译错误 (GOALS D1)"));
+                    return Err(self.error(Msg::TabAtLineStart));
                 }
                 _ => break,
             }
@@ -211,7 +210,7 @@ impl<'a> Lexer<'a> {
                     break;
                 }
                 if indent > current {
-                    return Err(self.error("缩进层级不匹配"));
+                    return Err(self.error(Msg::BadIndent));
                 }
             }
         }
@@ -241,12 +240,12 @@ impl<'a> Lexer<'a> {
         if is_float {
             let value = text
                 .parse::<f64>()
-                .map_err(|_| self.error("无效的浮点数字面量"))?;
+                .map_err(|_| self.error(Msg::BadFloat))?;
             self.push(TokenKind::Float(value), sl, sc);
         } else {
             let value = text
                 .parse::<i64>()
-                .map_err(|_| self.error("无效的整数面量(或超出 i64 范围;任意精度整数未实现)"))?;
+                .map_err(|_| self.error(Msg::BadInt))?;
             self.push(TokenKind::Int(value), sl, sc);
         }
         Ok(())
@@ -300,7 +299,7 @@ impl<'a> Lexer<'a> {
         let mut buf = Vec::new();
         loop {
             let Some(&c) = self.src.get(self.pos) else {
-                return Err(self.error("未闭合的字符串字面量"));
+                return Err(self.error(Msg::UnterminatedString));
             };
             match c {
                 b'"' => {
@@ -310,7 +309,7 @@ impl<'a> Lexer<'a> {
                 b'\\' => {
                     self.advance();
                     let Some(&esc) = self.src.get(self.pos) else {
-                        return Err(self.error("字符串末尾的转义不完整"));
+                        return Err(self.error(Msg::IncompleteEscape));
                     };
                     let decoded = match esc {
                         b'n' => b'\n',
@@ -320,14 +319,16 @@ impl<'a> Lexer<'a> {
                         b'\\' => b'\\',
                         b'"' => b'"',
                         other => {
-                            return Err(self.error(&format!("未知转义序列 \\{}", other as char)));
+                            return Err(self.error(Msg::UnknownEscape(
+                                (other as char).to_string(),
+                            )));
                         }
                     };
                     self.advance();
                     buf.push(decoded);
                 }
                 b'\n' => {
-                    return Err(self.error("字符串不能跨行(多行字符串未实现)"));
+                    return Err(self.error(Msg::StringAcrossLines));
                 }
                 _ => {
                     buf.push(c);
@@ -336,7 +337,7 @@ impl<'a> Lexer<'a> {
             }
         }
         let text =
-            String::from_utf8(buf).map_err(|_| self.error("字符串不是合法 UTF-8"))?;
+            String::from_utf8(buf).map_err(|_| self.error(Msg::InvalidUtf8))?;
         self.push(TokenKind::Str(text), sl, sc);
         Ok(())
     }
@@ -384,7 +385,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     self.push(TokenKind::BangEq, sl, sc);
                 } else {
-                    return Err(self.error("意外的 '!'"));
+                    return Err(self.error(Msg::UnexpectedBang));
                 }
             }
             b'<' => {
@@ -436,7 +437,7 @@ impl<'a> Lexer<'a> {
                 self.push(TokenKind::RBracket, sl, sc);
             }
             _ => {
-                return Err(self.error(&format!("无法识别的字符 '{}'", c as char)));
+                return Err(self.error(Msg::UnknownChar(c as char)));
             }
         }
         Ok(())
@@ -465,11 +466,9 @@ impl<'a> Lexer<'a> {
         self.src.get(self.pos + 1).copied()
     }
 
-    fn error(&self, message: &str) -> LexError {
+    fn error(&self, msg: Msg) -> LexError {
         LexError {
-            message: message.to_string(),
-            line: self.line,
-            column: self.col,
+            diag: Diagnostic::new(msg, self.line, self.col),
         }
     }
 }
@@ -584,6 +583,13 @@ mod tests {
     fn tabs_are_rejected() {
         assert!(lex("let x = 1\n\tlet y = 2\n").is_err());
         assert!(lex("let\tx = 1\n").is_err());
+    }
+
+    #[test]
+    fn error_has_stable_code() {
+        let err = lex("let\tx = 1\n").unwrap_err();
+        assert_eq!(err.diag.code, "E0001");
+        assert!(err.to_string().contains("[E0001]"));
     }
 
     #[test]
