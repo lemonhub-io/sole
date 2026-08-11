@@ -34,7 +34,10 @@ mod tests {
 
     #[test]
     fn hello_world() {
-        assert_eq!(run_with_output("print(\"hello, sole!\")\n").unwrap(), "hello, sole!\n");
+        assert_eq!(
+            run_with_output("print(\"hello, sole!\")\n").unwrap(),
+            "hello, sole!\n"
+        );
     }
 
     #[test]

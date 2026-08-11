@@ -728,10 +728,10 @@ mod tests {
         };
         assert_eq!(
             f.params[0].ty,
-            Type::Ref(Box::new(Type::Named("List".into(), vec![Type::Named(
-                "int".into(),
-                vec![]
-            )])))
+            Type::Ref(Box::new(Type::Named(
+                "List".into(),
+                vec![Type::Named("int".into(), vec![])]
+            )))
         );
     }
 

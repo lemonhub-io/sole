@@ -18,10 +18,7 @@ fn main() -> ExitCode {
                         i += 2;
                     }
                     None => {
-                        eprintln!(
-                            "error: unknown language `{}` (supported: en, zh)",
-                            value
-                        );
+                        eprintln!("error: unknown language `{}` (supported: en, zh)", value);
                         return ExitCode::from(2);
                     }
                 }

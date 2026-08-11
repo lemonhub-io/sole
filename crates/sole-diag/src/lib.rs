@@ -151,8 +151,7 @@ impl Msg {
         match self {
             Msg::TabNotAllowed => "tab characters are not allowed (GOALS D1)".into(),
             Msg::TabAtLineStart => {
-                "tab at line start: mixing tabs and spaces is a compile error (GOALS D1)"
-                    .into()
+                "tab at line start: mixing tabs and spaces is a compile error (GOALS D1)".into()
             }
             Msg::BadIndent => "indentation does not match any outer level".into(),
             Msg::UnterminatedString => "unterminated string literal".into(),
@@ -161,11 +160,9 @@ impl Msg {
             Msg::StringAcrossLines => "string literal cannot span lines".into(),
             Msg::InvalidUtf8 => "string is not valid UTF-8".into(),
             Msg::BadFloat => "invalid float literal".into(),
-            Msg::BadInt => {
-                "invalid integer literal (or out of i64 range; arbitrary-precision \
+            Msg::BadInt => "invalid integer literal (or out of i64 range; arbitrary-precision \
                  integers are not implemented yet)"
-                    .into()
-            }
+                .into(),
             Msg::UnexpectedBang => "unexpected `!`".into(),
             Msg::UnknownChar(c) => format!("unrecognized character `{}`", c),
             Msg::ExpectedToken(t) => format!("expected `{}`", t),
@@ -253,9 +250,10 @@ impl Msg {
             Msg::ForNotSupported(v) => {
                 format!("`for` 暂仅支持 Range(集合/通道见 GOALS D6/§7);得到 {}", v)
             }
-            Msg::ArgCount(name, expected, actual) => {
-                format!("函数 `{}` 期望 {} 个参数,实际 {} 个", name, expected, actual)
-            }
+            Msg::ArgCount(name, expected, actual) => format!(
+                "函数 `{}` 期望 {} 个参数,实际 {} 个",
+                name, expected, actual
+            ),
             Msg::RangeNotInt => "`range` 参数必须是整数".into(),
             Msg::RangeArgCount => "`range` 期望 1 或 2 个参数".into(),
             Msg::BadCondition => "该值不能用作条件".into(),

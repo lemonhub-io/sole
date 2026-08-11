@@ -175,12 +175,8 @@ fn eval_stmt(
                 eval_block(then_block, program, env, &mut *out)
             } else {
                 match else_block {
-                    Some(ElseBranch::If(stmt)) => {
-                        eval_stmt(stmt, program, env, &mut *out)
-                    }
-                    Some(ElseBranch::Block(block)) => {
-                        eval_block(block, program, env, &mut *out)
-                    }
+                    Some(ElseBranch::If(stmt)) => eval_stmt(stmt, program, env, &mut *out),
+                    Some(ElseBranch::Block(block)) => eval_block(block, program, env, &mut *out),
                     None => Ok(Flow::Next),
                 }
             }
@@ -255,9 +251,9 @@ fn eval_expr(
         Expr::Float(f) => Ok(Value::Float(*f)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
-        Expr::Ident(name) => env.lookup(name).ok_or_else(|| {
-            err(Msg::UndefinedVariable(name.clone()))
-        }),
+        Expr::Ident(name) => env
+            .lookup(name)
+            .ok_or_else(|| err(Msg::UndefinedVariable(name.clone()))),
         Expr::Unary { op, expr } => {
             let v = eval_expr(expr, program, env, &mut *out)?;
             match op {
@@ -364,8 +360,7 @@ fn call_builtin(
                 let v = eval_expr(a, program, env, &mut *out)?;
                 parts.push(format_value(&v));
             }
-            writeln!(out, "{}", parts.join(" "))
-                .map_err(|e| err(Msg::Io(e.to_string())))?;
+            writeln!(out, "{}", parts.join(" ")).map_err(|e| err(Msg::Io(e.to_string())))?;
             Ok(Some(Value::Unit))
         }
         "range" => {
@@ -412,9 +407,7 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
             (Value::Int(a), Value::Float(b)) => float_op(op, a as f64, b),
             (Value::Float(a), Value::Int(b)) => float_op(op, a, b as f64),
             (Value::Float(a), Value::Float(b)) => float_op(op, a, b),
-            (Value::Str(a), Value::Str(b)) if op == Add => {
-                Ok(Value::Str(format!("{}{}", a, b)))
-            }
+            (Value::Str(a), Value::Str(b)) if op == Add => Ok(Value::Str(format!("{}{}", a, b))),
             _ => Err(err(Msg::TypeMismatch)),
         },
         Eq | Ne | Lt | Le | Gt | Ge => cmp_op(op, &l, &r),
@@ -438,17 +431,15 @@ fn float_op(op: BinOp, a: f64, b: f64) -> Result<Value, EvalError> {
 fn cmp_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
     use BinOp::*;
     let result = match (l, r) {
-        (Value::Int(a), Value::Int(b)) => {
-            match op {
-                Eq => *a == *b,
-                Ne => *a != *b,
-                Lt => *a < *b,
-                Le => *a <= *b,
-                Gt => *a > *b,
-                Ge => *a >= *b,
-                _ => unreachable!("comparison op"),
-            }
-        }
+        (Value::Int(a), Value::Int(b)) => match op {
+            Eq => *a == *b,
+            Ne => *a != *b,
+            Lt => *a < *b,
+            Le => *a <= *b,
+            Gt => *a > *b,
+            Ge => *a >= *b,
+            _ => unreachable!("comparison op"),
+        },
         (Value::Int(a), Value::Float(b)) => num_cmp(op, *a as f64, *b),
         (Value::Float(a), Value::Int(b)) => num_cmp(op, *a, *b as f64),
         (Value::Float(a), Value::Float(b)) => num_cmp(op, *a, *b),

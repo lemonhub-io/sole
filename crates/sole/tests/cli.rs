@@ -19,10 +19,7 @@ fn cli_hello_world() {
 
 #[test]
 fn cli_bilingual_error_messages() {
-    let path = std::env::temp_dir().join(format!(
-        "sole_undefined_{}.sole",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("sole_undefined_{}.sole", std::process::id()));
     let mut f = std::fs::File::create(&path).unwrap();
     writeln!(f, "print(x)").unwrap();
     drop(f);
@@ -46,9 +43,5 @@ fn cli_bilingual_error_messages() {
         "en: {}",
         en_err
     );
-    assert!(
-        zh_err.contains("[E0201] 未定义变量 `x`"),
-        "zh: {}",
-        zh_err
-    );
+    assert!(zh_err.contains("[E0201] 未定义变量 `x`"), "zh: {}", zh_err);
 }

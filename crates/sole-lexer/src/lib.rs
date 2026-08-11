@@ -238,14 +238,10 @@ impl<'a> Lexer<'a> {
             .expect("number text is ASCII")
             .replace('_', "");
         if is_float {
-            let value = text
-                .parse::<f64>()
-                .map_err(|_| self.error(Msg::BadFloat))?;
+            let value = text.parse::<f64>().map_err(|_| self.error(Msg::BadFloat))?;
             self.push(TokenKind::Float(value), sl, sc);
         } else {
-            let value = text
-                .parse::<i64>()
-                .map_err(|_| self.error(Msg::BadInt))?;
+            let value = text.parse::<i64>().map_err(|_| self.error(Msg::BadInt))?;
             self.push(TokenKind::Int(value), sl, sc);
         }
         Ok(())
@@ -319,9 +315,7 @@ impl<'a> Lexer<'a> {
                         b'\\' => b'\\',
                         b'"' => b'"',
                         other => {
-                            return Err(self.error(Msg::UnknownEscape(
-                                (other as char).to_string(),
-                            )));
+                            return Err(self.error(Msg::UnknownEscape((other as char).to_string())));
                         }
                     };
                     self.advance();
@@ -336,8 +330,7 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        let text =
-            String::from_utf8(buf).map_err(|_| self.error(Msg::InvalidUtf8))?;
+        let text = String::from_utf8(buf).map_err(|_| self.error(Msg::InvalidUtf8))?;
         self.push(TokenKind::Str(text), sl, sc);
         Ok(())
     }
@@ -532,7 +525,11 @@ mod tests {
     fn strings_and_escapes() {
         assert_eq!(
             kinds("\"a\\nb\"\n"),
-            vec![TokenKind::Str("a\nb".into()), TokenKind::Newline, TokenKind::Eof]
+            vec![
+                TokenKind::Str("a\nb".into()),
+                TokenKind::Newline,
+                TokenKind::Eof
+            ]
         );
     }
 
