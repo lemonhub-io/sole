@@ -79,6 +79,10 @@ impl Env {
         }
     }
 
+    fn push_scope(&mut self) {
+        self.locals.push(HashMap::new());
+    }
+
     fn set(&mut self, name: &str, value: Value) -> Result<(), EvalError> {
         for scope in self.locals.iter_mut().rev() {
             if let Some(b) = scope.get_mut(name) {

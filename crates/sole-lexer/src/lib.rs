@@ -511,10 +511,10 @@ mod tests {
     #[test]
     fn numbers_with_separators_and_floats() {
         assert_eq!(
-            kinds("1_000_000 3.14\n"),
+            kinds("1_000_000 2.5\n"),
             vec![
                 TokenKind::Int(1_000_000),
-                TokenKind::Float(3.14),
+                TokenKind::Float(2.5),
                 TokenKind::Newline,
                 TokenKind::Eof,
             ]
