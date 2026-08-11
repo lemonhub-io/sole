@@ -3,7 +3,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut lang: Option<sole::Lang> = None;
-    let mut command: Option<(&str, Option<&str>)> = None;
+    let mut path: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -23,27 +23,33 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            "run" => {
-                let path = args.get(i + 1).map(String::as_str);
-                command = Some(("run", path));
-                i += 2;
-            }
             "--version" | "-V" => {
                 println!("sole {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
-            other => {
+            "run" => {
+                i += 1;
+            }
+            other if other.starts_with('-') => {
                 eprintln!("error: unknown argument `{}`", other);
                 return ExitCode::from(2);
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("error: unexpected extra argument `{}`", other);
+                    return ExitCode::from(2);
+                }
+                path = Some(other.to_string());
+                i += 1;
             }
         }
     }
     if let Some(l) = lang {
         sole::set_lang(l);
     }
-    match command {
-        Some(("run", Some(path))) => {
-            let source = match std::fs::read_to_string(path) {
+    match path {
+        Some(path) => {
+            let source = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: cannot read {}: {}", path, e);
@@ -58,7 +64,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        _ => {
+        None => {
             eprintln!(
                 "Sole {} — an AI-friendly programming language",
                 env!("CARGO_PKG_VERSION")

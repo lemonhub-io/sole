@@ -139,6 +139,12 @@ impl<'a> Lexer<'a> {
                         self.at_line_start = true;
                     }
                 }
+                Some(b'\r') => {
+                    self.advance();
+                    if self.peek() != Some(b'\n') {
+                        return Err(self.error(Msg::UnknownChar('\r')));
+                    }
+                }
                 Some(b' ') => {
                     self.advance();
                 }
@@ -171,31 +177,36 @@ impl<'a> Lexer<'a> {
     /// Handles the start of a new logical line: counts indentation, emits
     /// INDENT/DEDENT, and skips blank or comment-only lines silently.
     fn handle_line_start(&mut self) -> Result<(), LexError> {
-        let mut indent = 0usize;
-        while self.pos < self.src.len() {
-            match self.src[self.pos] {
-                b' ' => {
-                    indent += 1;
-                    self.advance();
+        let mut indent;
+        loop {
+            indent = 0;
+            while self.pos < self.src.len() {
+                match self.src[self.pos] {
+                    b' ' => {
+                        indent += 1;
+                        self.advance();
+                    }
+                    b'\t' => {
+                        return Err(self.error(Msg::TabAtLineStart));
+                    }
+                    _ => break,
                 }
-                b'\t' => {
-                    return Err(self.error(Msg::TabAtLineStart));
-                }
-                _ => break,
             }
-        }
-        // Blank or comment-only lines do not affect indentation.
-        match self.peek() {
-            None | Some(b'\n') | Some(b'#') => {
-                while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
-                    self.advance();
+            // Blank or comment-only lines do not affect indentation.
+            match self.peek() {
+                Some(b'\n') | Some(b'#') => {
+                    while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
+                        self.advance();
+                    }
+                    if self.pos < self.src.len() {
+                        self.advance(); // consume the newline silently
+                    }
+                    continue;
                 }
-                if self.pos < self.src.len() {
-                    self.advance(); // consume the newline silently
-                }
-                return Ok(());
+                None => return Ok(()),
+                _ => {}
             }
-            _ => {}
+            break;
         }
         let top = *self.indent_stack.last().expect("indent stack never empty");
         if indent > top {
