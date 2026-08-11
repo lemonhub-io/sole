@@ -545,27 +545,34 @@ impl<'a> Checker<'a> {
     }
 
     /// Checks a block. Borrows created inside the block are released at its
-    /// end (lexical borrow regions).
+    /// end (lexical borrow regions); borrows that existed on entry (outer
+    /// borrows) survive the block. Reference-typed variables created inside
+    /// the block die with it.
     fn check_block(&mut self, block: &Block) -> Result<(), TypeError> {
-        let snapshot = self
+        let snapshot: HashMap<String, State> = self
             .vars
             .last()
-            .map(|scope| {
-                scope
-                    .iter()
-                    .filter(|(_, v)| !matches!(v.state, State::Live))
-                    .map(|(k, v)| (k.clone(), v.state))
-                    .collect::<Vec<_>>()
-            })
+            .map(|scope| scope.iter().map(|(k, v)| (k.clone(), v.state)).collect())
             .unwrap_or_default();
         for stmt in &block.stmts {
             self.check_stmt(stmt)?;
         }
         if let Some(scope) = self.vars.last_mut() {
-            for (k, state) in snapshot {
-                if let Some(v) = scope.get_mut(&k) {
-                    if matches!(state, State::BorrowedImm | State::BorrowedMut) {
-                        v.state = State::Live;
+            for (name, var) in scope.iter_mut() {
+                match snapshot.get(name) {
+                    // Outer borrow or move: survives the block.
+                    Some(State::BorrowedImm) | Some(State::BorrowedMut) | Some(State::Moved) => {}
+                    // Live at entry: a borrow created in this block dies here.
+                    Some(State::Live) => {
+                        if matches!(var.state, State::BorrowedImm | State::BorrowedMut) {
+                            var.state = State::Live;
+                        }
+                    }
+                    // Created inside the block: reference bindings die with it.
+                    None => {
+                        if matches!(var.ty, Ty::Ref(_) | Ty::MutRef(_)) {
+                            var.state = State::Moved;
+                        }
                     }
                 }
             }
@@ -1758,6 +1765,37 @@ mod tests {
             msg,
             "3:5: [E0404] cannot return a reference to a local value (it would dangle)"
         );
+    }
+
+    // ---- M2 收尾: lexical borrow regions ----
+
+    #[test]
+    fn outer_borrow_survives_blocks() {
+        let msg = check_err("let a = [1, 2]\nlet r = ref a\nif true:\n    print(1)\nlet b = a\n");
+        assert!(msg.contains("[E0402]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn inner_borrow_dies_with_block() {
+        check_ok("let a = [1, 2]\nif true:\n    let r = ref a\nlet b = a\nprint(b.len())\n");
+    }
+
+    #[test]
+    fn inner_ref_binding_dies_with_block() {
+        let msg = check_err("let a = [1, 2]\nif true:\n    let r = ref a\nprint(r.len())\n");
+        assert!(msg.contains("[E0401]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn nested_blocks_release_inner_borrows() {
+        check_ok(
+            "let a = [1, 2]\nif true:\n    if true:\n        let r = ref a\nlet b = a\nprint(b.len())\n",
+        );
+    }
+
+    #[test]
+    fn while_body_borrow_dies_with_loop() {
+        check_ok("let a = [1, 2]\nlet mut n = 0\nwhile n < 1:\n    let r = ref a\n    n = n + 1\nlet b = a\nprint(b.len())\n");
     }
 
     #[test]

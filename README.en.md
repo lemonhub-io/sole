@@ -32,6 +32,9 @@ Currently supported:
 ```sh
 cargo run --bin sole -- run examples/hello.sole
 cargo run --bin sole -- run examples/fib.sole
+cargo run --bin sole -- run examples/list.sole       # List + borrows (M2)
+cargo run --bin sole -- run examples/borrow.sole     # ref / mut ref (M2)
+cargo run --bin sole -- run examples/shapes.sole     # struct / interface (M2)
 cargo run --bin sole -- run --lang zh examples/hello.sole   # Chinese error messages
 cargo test --workspace
 ```

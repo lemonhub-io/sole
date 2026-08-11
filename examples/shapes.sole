@@ -1,0 +1,28 @@
+# 结构体 / 接口 / 方法(M2 参考实现)
+interface Shape:
+    fn area(self: ref Shape) -> float
+    fn name(self: ref Shape) -> str
+
+struct Circle:
+    r: float
+
+struct Rect:
+    w: float
+    h: float
+
+impl Circle: Shape:
+    fn area(self: ref Circle) -> float:
+        return 3.14 * self.r * self.r
+    fn name(self: ref Circle) -> str:
+        return "circle"
+
+impl Rect: Shape:
+    fn area(self: ref Rect) -> float:
+        return self.w * self.h
+    fn name(self: ref Rect) -> str:
+        return "rect"
+
+let shapes: List[Shape] = [Circle(1.0), Rect(2.0, 3.0)]
+for s in ref shapes:
+    print(s.name())
+    print(s.area())

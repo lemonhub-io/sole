@@ -1,0 +1,16 @@
+# 借用与可变性(M2 参考实现)
+fn total(xs: ref List[int]) -> int:
+    let mut sum = 0
+    for x in ref xs:
+        sum = sum + x
+    return sum
+
+fn fill(xs: mut ref List[int], n: int) -> int:
+    xs.push(n)
+    return xs.len()
+
+let mut data: List[int] = [10, 20]
+print(total(data))
+print(fill(data, 30))
+print(data.len())
+print(data[0])

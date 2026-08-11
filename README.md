@@ -26,6 +26,9 @@
 ```sh
 cargo run --bin sole -- run examples/hello.sole
 cargo run --bin sole -- run examples/fib.sole
+cargo run --bin sole -- run examples/list.sole       # List + 借用(M2)
+cargo run --bin sole -- run examples/borrow.sole     # ref / mut ref(M2)
+cargo run --bin sole -- run examples/shapes.sole     # struct / interface(M2)
 cargo run --bin sole -- run --lang zh examples/hello.sole   # 错误信息中文
 cargo test --workspace
 ```

@@ -157,4 +157,16 @@ print(sign(0))
         let src = "interface Shape:\n    fn area(self: ref Shape) -> float\nstruct Circle:\n    r: float\nimpl Circle: Shape:\n    fn area(self: ref Circle) -> float:\n        return 3.14 * self.r * self.r\nfn describe(s: ref Shape) -> float:\n    return s.area()\nlet c = Circle(1.0)\nprint(describe(ref c))\n";
         assert_eq!(run_with_output(src).unwrap(), "3.14\n");
     }
+
+    #[test]
+    fn mut_ref_parameter_writes_back_to_caller() {
+        let src = "fn fill(xs: mut ref List[int], n: int) -> int:\n    xs.push(n)\n    return xs.len()\nlet mut data = [10]\nprint(fill(data, 20))\nprint(data.len())\nprint(data[1])\n";
+        assert_eq!(run_with_output(src).unwrap(), "2\n2\n20\n");
+    }
+
+    #[test]
+    fn ref_parameter_does_not_copy() {
+        let src = "fn bump(xs: ref List[int]) -> int:\n    return xs.len()\nlet data = [1, 2, 3]\nprint(bump(data))\nprint(data.len())\n";
+        assert_eq!(run_with_output(src).unwrap(), "3\n3\n");
+    }
 }

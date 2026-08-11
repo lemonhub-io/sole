@@ -828,6 +828,7 @@ fn call_fn(
             call_span,
         ));
     }
+    // Evaluate args in the caller's scope first.
     let mut arg_values = Vec::new();
     for a in args {
         arg_values
@@ -836,8 +837,33 @@ fn call_fn(
     // Functions see globals + their own params, never caller locals.
     let saved = std::mem::take(&mut env.locals);
     env.push_scope();
-    for (p, v) in fdef.params.iter().zip(arg_values) {
-        env.insert_local(p.name.clone(), v, p.is_mut);
+    for (i, p) in fdef.params.iter().enumerate() {
+        let v = arg_values[i].clone();
+        // `ref`/`mut ref` parameters rebind to the caller's cell so that
+        // writes through `mut ref` reach the original variable.
+        let rebound = if matches!(p.ty, Type::Ref(_) | Type::MutRef(_)) {
+            if let Expr::Ident(name, _) = &args[i] {
+                let cell = saved
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(name))
+                    .map(|b| b.cell.clone())
+                    .or_else(|| env.global.get(name).map(|b| b.cell.clone()));
+                if let Some(cell) = cell {
+                    match &p.ty {
+                        Type::MutRef(_) => Value::MutRef(cell),
+                        _ => Value::Ref(cell),
+                    }
+                } else {
+                    v
+                }
+            } else {
+                v
+            }
+        } else {
+            v
+        };
+        env.insert_local(p.name.clone(), rebound, p.is_mut);
     }
     let result = eval_block(&fdef.body, program, env, table, &mut *out);
     env.locals = saved;
