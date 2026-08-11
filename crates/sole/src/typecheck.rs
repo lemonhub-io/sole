@@ -1,0 +1,1819 @@
+//! M2 static type checker.
+//!
+//! Full type checking for the M1/M2 language subset: literals, annotations,
+//! assignment, function signatures, calls, operators, loops, `List[T]`,
+//! structs, interfaces, and methods 闂?plus a flow-sensitive borrow/move
+//! checker (use-after-move, moves while borrowed, mutable borrow conflicts,
+//! borrow escape). Copy types (`int`/`float`/`bool`/`str`/`ref`) are exempt
+//! from move semantics.
+
+use sole_diag::{Diagnostic, Lang, Msg};
+use sole_parser::{
+    BinOp, Block, ElseBranch, Expr, FnDef, ImplDef, Item, MethodSig, Param, Program, Span, Stmt,
+    Type, UnOp,
+};
+use std::collections::HashMap;
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ty {
+    Int,
+    Float,
+    Bool,
+    Str,
+    Unit,
+    Range,
+    Fn,
+    Unknown,
+    List(Box<Ty>),
+    Struct(String),
+    Interface(String),
+    Ref(Box<Ty>),
+    MutRef(Box<Ty>),
+}
+
+impl Ty {
+    fn name(&self) -> String {
+        match self {
+            Ty::Int => "int".into(),
+            Ty::Float => "float".into(),
+            Ty::Bool => "bool".into(),
+            Ty::Str => "str".into(),
+            Ty::Unit => "()".into(),
+            Ty::Range => "Range".into(),
+            Ty::Fn => "fn".into(),
+            Ty::Unknown => "?".into(),
+            Ty::List(inner) => format!("List[{}]", inner.name()),
+            Ty::Struct(name) => name.clone(),
+            Ty::Interface(name) => name.clone(),
+            Ty::Ref(inner) => format!("ref {}", inner.name()),
+            Ty::MutRef(inner) => format!("mut ref {}", inner.name()),
+        }
+    }
+
+    fn is_copy(&self) -> bool {
+        matches!(
+            self,
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Ref(_) | Ty::Fn | Ty::Unknown
+        )
+    }
+
+    fn is_truthy(&self) -> bool {
+        matches!(
+            self,
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::List(_) | Ty::Unknown
+        )
+    }
+
+    fn deref(&self) -> &Ty {
+        match self {
+            Ty::Ref(inner) | Ty::MutRef(inner) => inner.deref(),
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeError {
+    pub diag: Diagnostic,
+}
+
+impl fmt::Display for TypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.diag.render(Lang::current()))
+    }
+}
+
+impl std::error::Error for TypeError {}
+
+fn err(msg: Msg, span: Span) -> TypeError {
+    TypeError {
+        diag: Diagnostic::new(msg, span.line, span.column),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Live,
+    Moved,
+    BorrowedImm,
+    BorrowedMut,
+}
+
+#[derive(Debug, Clone)]
+struct Var {
+    ty: Ty,
+    state: State,
+}
+
+impl Var {
+    fn new(ty: Ty) -> Self {
+        Self {
+            ty,
+            state: State::Live,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FnSig {
+    name: String,
+    params: Vec<(String, Ty)>,
+    ret: Ty,
+}
+
+pub struct Checker<'a> {
+    program: &'a Program,
+    fns: HashMap<String, FnSig>,
+    structs: HashMap<String, Vec<(String, Ty)>>,
+    interfaces: HashMap<String, Vec<MethodSig>>,
+    impls: HashMap<String, Vec<String>>,
+    methods: HashMap<(String, String), FnSig>,
+    vars: Vec<HashMap<String, Var>>,
+    current_fn: Option<String>,
+}
+
+/// Checks a whole program for static type and borrow errors.
+pub fn check(program: &Program) -> Result<(), TypeError> {
+    let mut checker = Checker {
+        program,
+        fns: HashMap::new(),
+        structs: HashMap::new(),
+        interfaces: HashMap::new(),
+        impls: HashMap::new(),
+        methods: HashMap::new(),
+        vars: Vec::new(),
+        current_fn: None,
+    };
+    checker.collect_types()?;
+    checker.collect_fns()?;
+    checker.collect_impls()?;
+    checker.check_interfaces()?;
+    checker.vars.push(HashMap::new());
+    for item in &program.items {
+        match item {
+            Item::Fn(_) | Item::Struct(_) | Item::Interface(_) | Item::Impl(_) => {}
+            Item::Stmt(stmt) => checker.check_stmt(stmt)?,
+        }
+    }
+    checker.vars.pop();
+    checker.check_functions()?;
+    Ok(())
+}
+
+impl<'a> Checker<'a> {
+    fn collect_fns(&mut self) -> Result<(), TypeError> {
+        for item in &self.program.items {
+            if let Item::Fn(f) = item {
+                let sig = self.fn_sig(&f.name, &f.params, f.ret.as_ref(), None)?;
+                self.fns.insert(f.name.clone(), sig);
+            }
+        }
+        Ok(())
+    }
+
+    fn fn_sig(
+        &self,
+        name: &str,
+        params: &[Param],
+        ret: Option<&Type>,
+        self_ty: Option<&Ty>,
+    ) -> Result<FnSig, TypeError> {
+        let mut sig_params = Vec::new();
+        for p in params {
+            let ty = self.ty_of_type(&p.ty, self_ty)?;
+            sig_params.push((p.name.clone(), ty));
+        }
+        let ret = match ret {
+            Some(t) => self.ty_of_type(t, self_ty)?,
+            None => Ty::Unit,
+        };
+        Ok(FnSig {
+            name: name.to_string(),
+            params: sig_params,
+            ret,
+        })
+    }
+
+    /// Resolves a parsed type to a `Ty`. `self_ty` substitutes `Self`.
+    fn ty_of_type(&self, t: &Type, self_ty: Option<&Ty>) -> Result<Ty, TypeError> {
+        match t {
+            Type::Named(name, args) => {
+                if args.is_empty() {
+                    match name.as_str() {
+                        "int" => return Ok(Ty::Int),
+                        "float" => return Ok(Ty::Float),
+                        "bool" => return Ok(Ty::Bool),
+                        "str" => return Ok(Ty::Str),
+                        "Self" => {
+                            if let Some(st) = self_ty {
+                                return Ok(st.deref().clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match name.as_str() {
+                    "List" => {
+                        if args.len() != 1 {
+                            return Err(err(
+                                Msg::ArgCount("List".into(), 1, args.len()),
+                                Span::new(0, 0),
+                            ));
+                        }
+                        let inner = self.ty_of_type(&args[0], self_ty)?;
+                        Ok(Ty::List(Box::new(inner)))
+                    }
+                    _ => {
+                        if args.is_empty() && self.structs.contains_key(name) {
+                            return Ok(Ty::Struct(name.clone()));
+                        }
+                        if args.is_empty() && self.interfaces.contains_key(name) {
+                            return Ok(Ty::Interface(name.clone()));
+                        }
+                        Err(err(Msg::UnknownType(name.clone()), Span::new(0, 0)))
+                    }
+                }
+            }
+            Type::Ref(inner) => Ok(Ty::Ref(Box::new(self.ty_of_type(inner, self_ty)?))),
+            Type::MutRef(inner) => Ok(Ty::MutRef(Box::new(self.ty_of_type(inner, self_ty)?))),
+        }
+    }
+
+    fn collect_types(&mut self) -> Result<(), TypeError> {
+        for item in &self.program.items {
+            match item {
+                Item::Struct(s) => {
+                    let mut fields = Vec::new();
+                    for (name, t) in &s.fields {
+                        let ty = self.ty_of_type(t, None)?;
+                        fields.push((name.clone(), ty));
+                    }
+                    self.structs.insert(s.name.clone(), fields);
+                }
+                Item::Interface(i) => {
+                    let methods = i.methods.clone();
+                    self.interfaces.insert(i.name.clone(), methods);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_impls(&mut self) -> Result<(), TypeError> {
+        for item in &self.program.items {
+            if let Item::Impl(imp) = item {
+                if !self.structs.contains_key(&imp.ty) {
+                    return Err(err(Msg::UnknownStruct(imp.ty.clone()), imp.span));
+                }
+                if let Some(iface) = &imp.interface {
+                    if !self.interfaces.contains_key(iface) {
+                        return Err(err(Msg::UnknownType(iface.clone()), imp.span));
+                    }
+                    self.impls
+                        .entry(imp.ty.clone())
+                        .or_default()
+                        .push(iface.clone());
+                }
+                for m in &imp.methods {
+                    let sig = self.method_sig(m, &imp.ty, imp.span)?;
+                    self.methods.insert((imp.ty.clone(), m.name.clone()), sig);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Signature of an impl method; first parameter must be `self` typed as
+    /// `Self`, `ref Self`, or `mut ref Self`.
+    fn method_sig(&self, m: &FnDef, ty: &str, impl_span: Span) -> Result<FnSig, TypeError> {
+        let Some(first) = m.params.first() else {
+            return Err(err(
+                Msg::OpTypeMismatch {
+                    op: "method".into(),
+                    actual: format!("method `{}` needs a `self` parameter", m.name),
+                },
+                impl_span,
+            ));
+        };
+        if first.name != "self" {
+            return Err(err(
+                Msg::OpTypeMismatch {
+                    op: "method".into(),
+                    actual: format!("first parameter of method `{}` must be `self`", m.name),
+                },
+                impl_span,
+            ));
+        }
+        let self_ty = Ty::Struct(ty.to_string());
+        let resolved = self.ty_of_type(&first.ty, Some(&self_ty))?;
+        if resolved != self_ty {
+            let ok = matches!(
+                resolved,
+                Ty::Ref(ref i) if **i == self_ty
+            ) || matches!(
+                resolved,
+                Ty::MutRef(ref i) if **i == self_ty
+            );
+            if !ok {
+                return Err(err(
+                    Msg::OpTypeMismatch {
+                        op: "self".into(),
+                        actual: format!(
+                            "`self` of method `{}` must be `Self`, `ref Self`, or `mut ref Self`",
+                            m.name
+                        ),
+                    },
+                    impl_span,
+                ));
+            }
+        }
+        self.fn_sig(&m.name, &m.params, m.ret.as_ref(), Some(&self_ty))
+    }
+
+    fn check_interfaces(&mut self) -> Result<(), TypeError> {
+        let interfaces = self.interfaces.clone();
+        let methods = self.methods.clone();
+        let impls = self.impls.clone();
+        for (ty, ifaces) in &impls {
+            for iface in ifaces {
+                let sigs = &interfaces[iface];
+                for m in sigs {
+                    if !methods.contains_key(&(ty.clone(), m.name.clone())) {
+                        return Err(err(
+                            Msg::MissingImplMethod {
+                                interface: iface.clone(),
+                                method: m.name.clone(),
+                            },
+                            Span::new(0, 0),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup(&self, name: &str) -> Option<&Var> {
+        for scope in self.vars.iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn lookup_mut(&mut self, name: &str) -> Option<&mut Var> {
+        for scope in self.vars.iter_mut().rev() {
+            if let Some(v) = scope.get_mut(name) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn bind(&mut self, name: String, ty: Ty) {
+        if let Some(scope) = self.vars.last_mut() {
+            scope.insert(name, Var::new(ty));
+        }
+    }
+
+    /// Reads a variable: `Moved` 闂?error. `BorrowedMut` 闂?conflict error.
+    fn read_var(&self, name: &str, span: Span) -> Result<Ty, TypeError> {
+        match self.lookup(name) {
+            Some(v) => match v.state {
+                State::Moved => Err(err(Msg::UseAfterMove(name.to_string()), span)),
+                State::BorrowedMut => Err(err(Msg::MutBorrowConflict(name.to_string()), span)),
+                State::Live | State::BorrowedImm => Ok(v.ty.clone()),
+            },
+            None => {
+                if self.fns.contains_key(name) {
+                    Ok(Ty::Fn)
+                } else {
+                    Err(err(Msg::UndefinedVariable(name.to_string()), span))
+                }
+            }
+        }
+    }
+
+    /// Consumes a variable (move semantics). No-op for Copy types.
+    fn move_var(&mut self, name: &str, span: Span) -> Result<Ty, TypeError> {
+        let ty = self.read_var(name, span)?;
+        if ty.is_copy() {
+            return Ok(ty);
+        }
+        let Some(v) = self.lookup_mut(name) else {
+            return Ok(ty);
+        };
+        match v.state {
+            State::Live => {
+                v.state = State::Moved;
+                Ok(ty)
+            }
+            State::BorrowedImm | State::BorrowedMut => {
+                Err(err(Msg::MoveWhileBorrowed(name.to_string()), span))
+            }
+            State::Moved => Err(err(Msg::UseAfterMove(name.to_string()), span)),
+        }
+    }
+
+    /// Borrows a variable (or a path rooted at a variable). Returns the
+    /// borrowed type. `persistent` marks a borrow that outlives the
+    /// statement (explicit `ref x` expressions); transient borrows (call
+    /// args, method receivers) check availability but do not mark.
+    fn borrow_var(&mut self, target: &Expr, mutable: bool, span: Span) -> Result<Ty, TypeError> {
+        let (root, field_ty) = self.borrow_path(target)?;
+        let ty = self.read_var(&root, span)?;
+        if ty.is_copy() {
+            return Ok(if mutable {
+                Ty::MutRef(Box::new(ty))
+            } else {
+                Ty::Ref(Box::new(ty))
+            });
+        }
+        let borrowed_ty = match field_ty {
+            Some(f) => f,
+            None => ty,
+        };
+        let Some(v) = self.lookup_mut(&root) else {
+            return Ok(borrowed_ty);
+        };
+        match v.state {
+            State::Live | State::BorrowedImm if !mutable => {
+                v.state = State::BorrowedImm;
+                Ok(if mutable {
+                    Ty::MutRef(Box::new(borrowed_ty))
+                } else {
+                    Ty::Ref(Box::new(borrowed_ty))
+                })
+            }
+            State::Live if mutable => {
+                v.state = State::BorrowedMut;
+                Ok(Ty::MutRef(Box::new(borrowed_ty)))
+            }
+            State::Moved => Err(err(Msg::UseAfterMove(root.to_string()), span)),
+            _ => Err(err(Msg::MutBorrowConflict(root.to_string()), span)),
+        }
+    }
+
+    /// Transient borrow for call args / method receivers: checks the
+    /// target can be borrowed but does not mark it (the borrow lives only
+    /// for the call).
+    fn borrow_var_transient(
+        &mut self,
+        target: &Expr,
+        mutable: bool,
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        let (root, field_ty) = self.borrow_path(target)?;
+        let ty = self.read_var(&root, span)?;
+        let borrowed_ty = match field_ty {
+            Some(f) => f,
+            None => ty,
+        };
+        if let Some(v) = self.lookup(&root) {
+            match v.state {
+                State::Live | State::BorrowedImm if !mutable => {}
+                State::Live if mutable => {}
+                State::Moved => return Err(err(Msg::UseAfterMove(root.to_string()), span)),
+                _ => return Err(err(Msg::MutBorrowConflict(root.to_string()), span)),
+            }
+        }
+        Ok(if mutable {
+            Ty::MutRef(Box::new(borrowed_ty))
+        } else {
+            Ty::Ref(Box::new(borrowed_ty))
+        })
+    }
+
+    /// Resolves a borrow target to its root variable and (for field
+    /// borrows) the field's type.
+    fn borrow_path(&self, target: &Expr) -> Result<(String, Option<Ty>), TypeError> {
+        match target {
+            Expr::Ident(name, _) => Ok((name.clone(), None)),
+            Expr::Field { obj, name, span } => {
+                let Expr::Ident(root, _) = obj.as_ref() else {
+                    return Err(err(Msg::UnknownBorrowTarget("non-variable".into()), *span));
+                };
+                let Some(v) = self.lookup(root) else {
+                    return Err(err(Msg::UndefinedVariable(root.clone()), *span));
+                };
+                let base = v.ty.deref().clone();
+                match &base {
+                    Ty::Struct(sname) => {
+                        let fields = self
+                            .structs
+                            .get(sname)
+                            .ok_or_else(|| err(Msg::UnknownStruct(sname.clone()), *span))?;
+                        let Some((_, fty)) = fields.iter().find(|(n, _)| n == name) else {
+                            return Err(err(
+                                Msg::UnknownField {
+                                    ty: sname.clone(),
+                                    field: name.clone(),
+                                },
+                                *span,
+                            ));
+                        };
+                        Ok((root.clone(), Some(fty.clone())))
+                    }
+                    other => Err(err(Msg::UnknownBorrowTarget(other.name()), *span)),
+                }
+            }
+            _ => Err(err(
+                Msg::UnknownBorrowTarget("non-variable".into()),
+                Span::new(0, 0),
+            )),
+        }
+    }
+
+    fn check_fn_body(&mut self, f: &FnDef) -> Result<(), TypeError> {
+        let sig = self
+            .fns
+            .get(&f.name)
+            .cloned()
+            .expect("function registered during collect_fns");
+        self.vars.push(HashMap::new());
+        self.current_fn = Some(f.name.clone());
+        for (p, ty) in f.params.iter().zip(&sig.params) {
+            self.bind(p.name.clone(), ty.1.clone());
+        }
+        let result = self.check_block(&f.body);
+        self.current_fn = None;
+        self.vars.pop();
+        result
+    }
+
+    /// Checks a block. Borrows created inside the block are released at its
+    /// end (lexical borrow regions).
+    fn check_block(&mut self, block: &Block) -> Result<(), TypeError> {
+        let snapshot = self
+            .vars
+            .last()
+            .map(|scope| {
+                scope
+                    .iter()
+                    .filter(|(_, v)| !matches!(v.state, State::Live))
+                    .map(|(k, v)| (k.clone(), v.state))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for stmt in &block.stmts {
+            self.check_stmt(stmt)?;
+        }
+        if let Some(scope) = self.vars.last_mut() {
+            for (k, state) in snapshot {
+                if let Some(v) = scope.get_mut(&k) {
+                    if matches!(state, State::BorrowedImm | State::BorrowedMut) {
+                        v.state = State::Live;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_stmt(&mut self, stmt: &Stmt) -> Result<(), TypeError> {
+        match stmt {
+            Stmt::Let {
+                name,
+                is_mut: _,
+                ty,
+                value,
+                span,
+            } => {
+                // Annotated list: check each element against the inner type,
+                // which also allows heterogenous struct elements when the
+                // annotation is an interface type.
+                if let (Some(annot), Expr::List(items, list_span)) = (ty, value) {
+                    let expected = self.ty_of_type(annot, None)?;
+                    if let Ty::List(inner) = &expected {
+                        for it in items {
+                            let t = self.infer_expr_consume(it, *list_span)?;
+                            if !self.is_compatible(inner, &t) {
+                                return Err(err(
+                                    Msg::ListElemMismatch {
+                                        expected: inner.name(),
+                                        actual: t.name(),
+                                    },
+                                    *list_span,
+                                ));
+                            }
+                        }
+                        self.bind(name.clone(), expected);
+                        return Ok(());
+                    }
+                }
+                let actual = self.infer_expr_consume(value, *span)?;
+                match ty {
+                    Some(annot) => {
+                        let expected = self.ty_of_type(annot, None)?;
+                        if !self.is_compatible(&expected, &actual) {
+                            return Err(err(
+                                Msg::LetTypeMismatch {
+                                    name: name.clone(),
+                                    expected: expected.name(),
+                                    actual: actual.name(),
+                                },
+                                *span,
+                            ));
+                        }
+                        self.bind(name.clone(), expected);
+                    }
+                    None => self.bind(name.clone(), actual),
+                }
+                Ok(())
+            }
+            Stmt::Assign { name, value, span } => {
+                let expected = self
+                    .lookup(name)
+                    .map(|v| v.ty.clone())
+                    .ok_or_else(|| err(Msg::UndefinedVariable(name.clone()), *span))?;
+                let actual = self.infer_expr_consume_skip(value, *span, name)?;
+                if !self.is_compatible(&expected, &actual) {
+                    return Err(err(
+                        Msg::AssignTypeMismatch {
+                            name: name.clone(),
+                            expected: expected.name(),
+                            actual: actual.name(),
+                        },
+                        *span,
+                    ));
+                }
+                if let Some(v) = self.lookup_mut(name) {
+                    match v.state {
+                        State::Moved => return Err(err(Msg::UseAfterMove(name.clone()), *span)),
+                        State::BorrowedImm | State::BorrowedMut => {
+                            return Err(err(Msg::MoveWhileBorrowed(name.clone()), *span))
+                        }
+                        State::Live => {}
+                    }
+                    v.state = State::Live;
+                }
+                Ok(())
+            }
+            Stmt::FieldAssign {
+                obj,
+                field,
+                value,
+                span,
+            } => {
+                let obj_ty = self.read_var(obj, *span)?;
+                let base = obj_ty.deref().clone();
+                let Ty::Struct(sname) = &base else {
+                    return Err(err(
+                        Msg::UnknownField {
+                            ty: base.name(),
+                            field: field.clone(),
+                        },
+                        *span,
+                    ));
+                };
+                let fields = self
+                    .structs
+                    .get(sname)
+                    .cloned()
+                    .ok_or_else(|| err(Msg::UnknownStruct(sname.clone()), *span))?;
+                let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) else {
+                    return Err(err(
+                        Msg::UnknownField {
+                            ty: sname.clone(),
+                            field: field.clone(),
+                        },
+                        *span,
+                    ));
+                };
+                let actual = self.infer_expr_consume(value, *span)?;
+                if !self.is_compatible(fty, &actual) {
+                    return Err(err(
+                        Msg::AssignTypeMismatch {
+                            name: format!("{}.{}", obj, field),
+                            expected: fty.name(),
+                            actual: actual.name(),
+                        },
+                        *span,
+                    ));
+                }
+                Ok(())
+            }
+            Stmt::Expr(expr) => {
+                self.infer_expr(expr)?;
+                Ok(())
+            }
+            Stmt::Return { value, span } => {
+                let expected = match &self.current_fn {
+                    Some(name) => self
+                        .fns
+                        .get(name)
+                        .map(|sig| sig.ret.clone())
+                        .unwrap_or(Ty::Unknown),
+                    None => Ty::Unknown,
+                };
+                if matches!(expected, Ty::Ref(_) | Ty::MutRef(_)) {
+                    self.check_ref_return(value.as_ref(), &expected, *span)?;
+                } else {
+                    let actual = match value {
+                        Some(expr) => self.infer_expr_consume(expr, *span)?,
+                        None => Ty::Unit,
+                    };
+                    if !self.is_compatible(&expected, &actual) {
+                        let func = self
+                            .current_fn
+                            .clone()
+                            .unwrap_or_else(|| "<top-level>".into());
+                        return Err(err(
+                            Msg::ReturnTypeMismatch {
+                                func,
+                                expected: expected.name(),
+                                actual: actual.name(),
+                            },
+                            *span,
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+                span,
+            } => {
+                let cond_ty = self.infer_expr(cond)?;
+                if !cond_ty.is_truthy() {
+                    return Err(err(
+                        Msg::OpTypeMismatch {
+                            op: "condition".into(),
+                            actual: cond_ty.name(),
+                        },
+                        *span,
+                    ));
+                }
+                self.check_block(then_block)?;
+                match else_block {
+                    Some(ElseBranch::If(stmt)) => self.check_stmt(stmt)?,
+                    Some(ElseBranch::Block(block)) => self.check_block(block)?,
+                    None => {}
+                }
+                Ok(())
+            }
+            Stmt::While { cond, body, span } => {
+                let cond_ty = self.infer_expr(cond)?;
+                if !cond_ty.is_truthy() {
+                    return Err(err(
+                        Msg::OpTypeMismatch {
+                            op: "condition".into(),
+                            actual: cond_ty.name(),
+                        },
+                        *span,
+                    ));
+                }
+                self.check_block(body)?;
+                Ok(())
+            }
+            Stmt::For {
+                var,
+                is_mut: _,
+                mode,
+                iterable,
+                body,
+                span,
+            } => {
+                let elem_ty = match mode {
+                    sole_parser::IterMode::Move => {
+                        let t = self.infer_expr_consume(iterable, *span)?;
+                        self.iter_elem(&t)?
+                    }
+                    sole_parser::IterMode::Borrow => {
+                        let t = self.infer_expr(iterable)?;
+                        let elem = self.iter_elem(t.deref())?;
+                        if let Expr::Ident(name, _) = iterable {
+                            if let Some(v) = self.lookup_mut(name) {
+                                v.state = State::BorrowedImm;
+                            }
+                        }
+                        elem
+                    }
+                    sole_parser::IterMode::MutBorrow => {
+                        let t = self.infer_expr(iterable)?;
+                        let elem = self.iter_elem(t.deref())?;
+                        if let Expr::Ident(name, _) = iterable {
+                            if let Some(v) = self.lookup_mut(name) {
+                                match v.state {
+                                    State::Live => v.state = State::BorrowedMut,
+                                    _ => {
+                                        return Err(err(
+                                            Msg::MutBorrowConflict(name.clone()),
+                                            *span,
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                        elem
+                    }
+                };
+                self.bind(var.clone(), elem_ty);
+                self.check_block(body)?;
+                // Release the borrow on the iterable (D6: usable after loop).
+                if let Expr::Ident(name, _) = iterable {
+                    if let Some(v) = self.lookup_mut(name) {
+                        v.state = State::Live;
+                    }
+                }
+                Ok(())
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
+        }
+    }
+
+    fn iter_elem(&self, t: &Ty) -> Result<Ty, TypeError> {
+        match t {
+            Ty::Range => Ok(Ty::Int),
+            Ty::List(inner) => Ok(inner.as_ref().clone()),
+            Ty::Unknown => Ok(Ty::Unknown),
+            other => Err(err(
+                Msg::OpTypeMismatch {
+                    op: "for-in".into(),
+                    actual: other.name(),
+                },
+                Span::new(0, 0),
+            )),
+        }
+    }
+
+    /// `return ref ...` 闂?the returned reference must derive from a
+    /// reference parameter (borrow propagation); locals escape.
+    fn check_ref_return(
+        &mut self,
+        value: Option<&Expr>,
+        expected: &Ty,
+        span: Span,
+    ) -> Result<(), TypeError> {
+        let Some(expr) = value else {
+            return Err(err(
+                Msg::ReturnTypeMismatch {
+                    func: self.current_fn.clone().unwrap_or_default(),
+                    expected: expected.name(),
+                    actual: "()".into(),
+                },
+                span,
+            ));
+        };
+        let root = self.ref_return_root(expr);
+        let ok = match root {
+            Some(name) => self
+                .lookup(&name)
+                .map(|v| matches!(v.ty, Ty::Ref(_) | Ty::MutRef(_)))
+                .unwrap_or(false),
+            None => false,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(err(Msg::BorrowEscape, span))
+        }
+    }
+
+    /// Root variable of an expression that may be a reference return:
+    /// `x`, `ref x`, `x.field`, `ref x.field`.
+    fn ref_return_root(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(name, _) => Some(name.clone()),
+            Expr::Borrow { expr, .. } => self.ref_return_root(expr),
+            Expr::Field { obj, .. } => self.ref_return_root(obj),
+            _ => None,
+        }
+    }
+
+    fn infer_expr(&mut self, expr: &Expr) -> Result<Ty, TypeError> {
+        self.infer_expr_inner(expr, false, None)
+    }
+
+    fn infer_expr_consume(&mut self, expr: &Expr, _span: Span) -> Result<Ty, TypeError> {
+        self.infer_expr_inner(expr, true, None)
+    }
+
+    fn infer_expr_consume_skip(
+        &mut self,
+        expr: &Expr,
+        _span: Span,
+        skip: &str,
+    ) -> Result<Ty, TypeError> {
+        self.infer_expr_inner(expr, true, Some(skip))
+    }
+
+    fn infer_expr_inner(
+        &mut self,
+        expr: &Expr,
+        consume: bool,
+        skip: Option<&str>,
+    ) -> Result<Ty, TypeError> {
+        match expr {
+            Expr::Int(..) => Ok(Ty::Int),
+            Expr::Float(..) => Ok(Ty::Float),
+            Expr::Str(..) => Ok(Ty::Str),
+            Expr::Bool(..) => Ok(Ty::Bool),
+            Expr::List(items, span) => {
+                let mut elem_ty: Option<Ty> = None;
+                for it in items {
+                    let t = self.infer_expr_consume(it, *span)?;
+                    match &elem_ty {
+                        None => elem_ty = Some(t),
+                        Some(e) => {
+                            if !self.is_compatible(e, &t) && !matches!(e, Ty::Unknown) {
+                                return Err(err(
+                                    Msg::ListElemMismatch {
+                                        expected: e.name(),
+                                        actual: t.name(),
+                                    },
+                                    *span,
+                                ));
+                            }
+                        }
+                    }
+                }
+                match elem_ty {
+                    Some(t) => Ok(Ty::List(Box::new(t))),
+                    None => Err(err(Msg::EmptyListNoType, *span)),
+                }
+            }
+            Expr::Ident(name, span) => {
+                if skip == Some(name.as_str()) {
+                    return self.read_var(name, *span);
+                }
+                if consume {
+                    self.move_var(name, *span)
+                } else {
+                    self.read_var(name, *span)
+                }
+            }
+            Expr::Unary { op, expr, span } => {
+                let inner = self.infer_expr(expr)?;
+                match op {
+                    UnOp::Neg => match inner {
+                        Ty::Int | Ty::Float => Ok(inner),
+                        _ => Err(err(
+                            Msg::OpTypeMismatch {
+                                op: "-".into(),
+                                actual: inner.name(),
+                            },
+                            *span,
+                        )),
+                    },
+                    UnOp::Not => Ok(Ty::Bool),
+                }
+            }
+            Expr::Binary { op, lhs, rhs, span } => self.infer_binary(*op, lhs, rhs, *span),
+            Expr::Call { callee, args, span } => self.infer_call(callee, args, *span),
+            Expr::Field { obj, name, span } => {
+                let obj_ty = self.infer_expr(obj)?;
+                let base = obj_ty.deref().clone();
+                match &base {
+                    Ty::Struct(sname) => {
+                        let fields = self
+                            .structs
+                            .get(sname)
+                            .ok_or_else(|| err(Msg::UnknownStruct(sname.clone()), *span))?;
+                        let Some((_, fty)) = fields.iter().find(|(n, _)| n == name) else {
+                            return Err(err(
+                                Msg::UnknownField {
+                                    ty: sname.clone(),
+                                    field: name.clone(),
+                                },
+                                *span,
+                            ));
+                        };
+                        Ok(fty.clone())
+                    }
+                    other => Err(err(
+                        Msg::UnknownField {
+                            ty: other.name(),
+                            field: name.clone(),
+                        },
+                        *span,
+                    )),
+                }
+            }
+            Expr::Index { obj, index, span } => {
+                let obj_ty = self.infer_expr(obj)?;
+                let idx_ty = self.infer_expr(index)?;
+                if !matches!(idx_ty, Ty::Int | Ty::Unknown) {
+                    return Err(err(Msg::IndexNotInt, *span));
+                }
+                let base = obj_ty.deref();
+                match base {
+                    Ty::List(inner) => Ok(inner.as_ref().clone()),
+                    Ty::Unknown => Ok(Ty::Unknown),
+                    other => Err(err(Msg::IndexOnNonList(other.name()), *span)),
+                }
+            }
+            Expr::Borrow {
+                mutable,
+                expr,
+                span,
+            } => self.borrow_var(expr, *mutable, *span),
+        }
+    }
+
+    fn infer_binary(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        use BinOp::*;
+        match op {
+            And | Or => {
+                let and_str = if op == And { "and" } else { "or" };
+                let l = self.infer_expr(lhs)?;
+                if !l.is_truthy() {
+                    return Err(err(
+                        Msg::OpTypeMismatch {
+                            op: and_str.into(),
+                            actual: l.name(),
+                        },
+                        span,
+                    ));
+                }
+                let r = self.infer_expr(rhs)?;
+                if !r.is_truthy() {
+                    return Err(err(
+                        Msg::OpTypeMismatch {
+                            op: and_str.into(),
+                            actual: r.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok(Ty::Bool)
+            }
+            Add | Sub | Mul | Div | Mod => {
+                let l = self.infer_expr(lhs)?;
+                let r = self.infer_expr(rhs)?;
+                match (&l, &r) {
+                    (Ty::Int, Ty::Int) => Ok(Ty::Int),
+                    (Ty::Float, Ty::Float) | (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => {
+                        Ok(Ty::Float)
+                    }
+                    (Ty::Str, Ty::Str) if op == Add => Ok(Ty::Str),
+                    (Ty::Unknown, t) | (t, Ty::Unknown) => Ok((*t).clone()),
+                    _ => Err(err(
+                        Msg::OpTypeMismatch {
+                            op: op_str(op).into(),
+                            actual: format!("{} and {}", l.name(), r.name()),
+                        },
+                        span,
+                    )),
+                }
+            }
+            Eq | Ne | Lt | Le | Gt | Ge => {
+                let l = self.infer_expr(lhs)?;
+                let r = self.infer_expr(rhs)?;
+                let ok = matches!(
+                    (&l, &r),
+                    (Ty::Int, Ty::Int)
+                        | (Ty::Float, Ty::Float)
+                        | (Ty::Int, Ty::Float)
+                        | (Ty::Float, Ty::Int)
+                        | (Ty::Str, Ty::Str)
+                        | (Ty::Bool, Ty::Bool)
+                        | (Ty::Unknown, _)
+                        | (_, Ty::Unknown)
+                );
+                if ok {
+                    Ok(Ty::Bool)
+                } else {
+                    Err(err(
+                        Msg::OpTypeMismatch {
+                            op: op_str(op).into(),
+                            actual: format!("{} and {}", l.name(), r.name()),
+                        },
+                        span,
+                    ))
+                }
+            }
+        }
+    }
+
+    fn infer_call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Result<Ty, TypeError> {
+        // Method call: obj.method(...)
+        if let Expr::Field { obj, name, .. } = callee {
+            return self.infer_method(obj, name, args, span);
+        }
+        if let Expr::Ident(name, _) = callee {
+            match name.as_str() {
+                "print" => {
+                    for a in args {
+                        self.infer_expr(a)?;
+                    }
+                    return Ok(Ty::Unit);
+                }
+                "range" => {
+                    for (i, a) in args.iter().enumerate() {
+                        let ty = self.infer_expr(a)?;
+                        if !matches!(ty, Ty::Int | Ty::Unknown) {
+                            return Err(err(
+                                Msg::ArgTypeMismatch {
+                                    func: "range".into(),
+                                    index: i,
+                                    expected: "int".into(),
+                                    actual: ty.name(),
+                                },
+                                span,
+                            ));
+                        }
+                    }
+                    if args.is_empty() || args.len() > 2 {
+                        return Err(err(Msg::ArgCount("range".into(), 2, args.len()), span));
+                    }
+                    return Ok(Ty::Range);
+                }
+                _ => {}
+            }
+            // Struct construction: `Circle(1, 2)` positional fields.
+            if let Some(fields) = self.structs.get(name).cloned() {
+                if args.len() != fields.len() {
+                    return Err(err(
+                        Msg::ArgCount(name.clone(), fields.len(), args.len()),
+                        span,
+                    ));
+                }
+                for (i, (a, (_, fty))) in args.iter().zip(&fields).enumerate() {
+                    let actual = self.infer_expr_consume(a, span)?;
+                    if !self.is_compatible(fty, &actual) {
+                        return Err(err(
+                            Msg::ArgTypeMismatch {
+                                func: name.clone(),
+                                index: i,
+                                expected: fty.name(),
+                                actual: actual.name(),
+                            },
+                            span,
+                        ));
+                    }
+                }
+                return Ok(Ty::Struct(name.clone()));
+            }
+            if let Some(sig) = self.fns.get(name).cloned() {
+                return self.check_fn_call(&sig, args, span);
+            }
+        }
+        // Non-identifier callee (e.g. a call expression result): skip.
+        self.infer_expr(callee)?;
+        for a in args {
+            self.infer_expr(a)?;
+        }
+        Ok(Ty::Unknown)
+    }
+
+    fn check_fn_call(&mut self, sig: &FnSig, args: &[Expr], span: Span) -> Result<Ty, TypeError> {
+        if args.len() != sig.params.len() {
+            return Err(err(
+                Msg::ArgCount(sig.name.clone(), sig.params.len(), args.len()),
+                span,
+            ));
+        }
+        for (i, (a, (_, expected))) in args.iter().zip(&sig.params).enumerate() {
+            let (actual, borrowed) = self.infer_call_arg(a, expected, span)?;
+            if !borrowed && !types_compatible(expected, &actual) {
+                return Err(err(
+                    Msg::ArgTypeMismatch {
+                        func: sig.name.clone(),
+                        index: i,
+                        expected: expected.name(),
+                        actual: actual.name(),
+                    },
+                    span,
+                ));
+            }
+        }
+        Ok(sig.ret.clone())
+    }
+
+    /// Checks one call argument against the expected type. Returns the
+    /// actual type and whether the argument was borrowed (ref param).
+    fn infer_call_arg(
+        &mut self,
+        arg: &Expr,
+        expected: &Ty,
+        span: Span,
+    ) -> Result<(Ty, bool), TypeError> {
+        match expected {
+            Ty::Ref(inner) => {
+                let t = match arg {
+                    Expr::Ident(..) => self.borrow_var_transient(arg, false, span)?,
+                    // Value expressions coerce into a temporary the call
+                    // borrows for its duration.
+                    _ => self.infer_expr(arg)?,
+                };
+                let ty = t.deref().clone();
+                if !self.is_compatible(inner, &ty) && !matches!(inner.as_ref(), Ty::Unknown) {
+                    return Err(err(
+                        Msg::ArgTypeMismatch {
+                            func: "<call>".into(),
+                            index: 0,
+                            expected: inner.name(),
+                            actual: ty.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok((t, true))
+            }
+            Ty::MutRef(inner) => {
+                let t = match arg {
+                    Expr::Ident(..) => self.borrow_var_transient(arg, true, span)?,
+                    _ => self.infer_expr(arg)?,
+                };
+                let ty = t.deref().clone();
+                if !self.is_compatible(inner, &ty) && !matches!(inner.as_ref(), Ty::Unknown) {
+                    return Err(err(
+                        Msg::ArgTypeMismatch {
+                            func: "<call>".into(),
+                            index: 0,
+                            expected: inner.name(),
+                            actual: ty.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok((t, true))
+            }
+            _ => {
+                let t = self.infer_expr_consume(arg, span)?;
+                Ok((t, false))
+            }
+        }
+    }
+
+    fn infer_method(
+        &mut self,
+        obj: &Expr,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        let obj_ty = self.infer_expr(obj)?;
+        let base = obj_ty.deref().clone();
+        match &base {
+            Ty::List(inner) => self.infer_list_method(obj, inner, name, args, span),
+            Ty::Struct(sname) => {
+                if let Some(sig) = self
+                    .methods
+                    .get(&(sname.clone(), name.to_string()))
+                    .cloned()
+                {
+                    // The receiver is borrowed for the duration of the call;
+                    // `self` is the first parameter and is not user-supplied.
+                    self.borrow_var_transient(obj, false, span)?;
+                    let expected = sig.params[0].1.clone();
+                    if !matches!(expected, Ty::Ref(_) | Ty::MutRef(_)) {
+                        // self by value: receiver moves into the method.
+                        self.move_var_obj(obj, span)?;
+                    }
+                    self.check_method_args(&sig, args, span)
+                } else {
+                    Err(err(
+                        Msg::UnknownMethod {
+                            ty: sname.clone(),
+                            method: name.to_string(),
+                        },
+                        span,
+                    ))
+                }
+            }
+            Ty::Interface(iname) => {
+                // Interface method calls check against the interface
+                // declaration; dispatch happens at runtime by struct type.
+                let sigs = self.interfaces.get(iname).cloned().unwrap_or_default();
+                let Some(method) = sigs.iter().find(|m| m.name == *name) else {
+                    return Err(err(
+                        Msg::UnknownMethod {
+                            ty: iname.clone(),
+                            method: name.to_string(),
+                        },
+                        span,
+                    ));
+                };
+                self.borrow_var_transient(obj, false, span)?;
+                let sig = self.fn_sig(
+                    &method.name,
+                    &method.params,
+                    method.ret.as_ref(),
+                    Some(&Ty::Interface(iname.clone())),
+                )?;
+                self.check_method_args(&sig, args, span)
+            }
+            Ty::Unknown => {
+                for a in args {
+                    self.infer_expr(a)?;
+                }
+                Ok(Ty::Unknown)
+            }
+            other => Err(err(
+                Msg::UnknownMethod {
+                    ty: other.name(),
+                    method: name.to_string(),
+                },
+                span,
+            )),
+        }
+    }
+
+    /// Checks the user-supplied args of a method call, skipping `self`.
+    fn check_method_args(
+        &mut self,
+        sig: &FnSig,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        let expected_params = &sig.params[1..];
+        if args.len() != expected_params.len() {
+            return Err(err(
+                Msg::ArgCount(sig.name.clone(), expected_params.len(), args.len()),
+                span,
+            ));
+        }
+        for (i, (a, (_, expected))) in args.iter().zip(expected_params).enumerate() {
+            let (actual, borrowed) = self.infer_call_arg(a, expected, span)?;
+            if !borrowed && !types_compatible(expected, &actual) {
+                return Err(err(
+                    Msg::ArgTypeMismatch {
+                        func: sig.name.clone(),
+                        index: i + 1,
+                        expected: expected.name(),
+                        actual: actual.name(),
+                    },
+                    span,
+                ));
+            }
+        }
+        Ok(sig.ret.clone())
+    }
+
+    /// Moves a non-copy receiver passed to a by-value `self` parameter.
+    fn move_var_obj(&mut self, obj: &Expr, span: Span) -> Result<(), TypeError> {
+        if let Expr::Ident(name, _) = obj {
+            let ty = self.read_var(name, span)?;
+            if !ty.is_copy() {
+                self.move_var(name, span)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn infer_list_method(
+        &mut self,
+        obj: &Expr,
+        inner: &Ty,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        match name {
+            "len" => {
+                if !args.is_empty() {
+                    return Err(err(Msg::ArgCount("List.len".into(), 0, args.len()), span));
+                }
+                Ok(Ty::Int)
+            }
+            "push" => {
+                if args.len() != 1 {
+                    return Err(err(Msg::ArgCount("List.push".into(), 1, args.len()), span));
+                }
+                let t = self.infer_expr_consume(&args[0], span)?;
+                if !self.is_compatible(inner, &t) && !matches!(inner, Ty::Unknown) {
+                    return Err(err(
+                        Msg::ArgTypeMismatch {
+                            func: "List.push".into(),
+                            index: 0,
+                            expected: inner.name(),
+                            actual: t.name(),
+                        },
+                        span,
+                    ));
+                }
+                // push mutates: requires a mutable borrow of the receiver.
+                self.borrow_var_transient(obj, true, span)?;
+                Ok(Ty::Unit)
+            }
+            "get" => {
+                if args.len() != 1 {
+                    return Err(err(Msg::ArgCount("List.get".into(), 1, args.len()), span));
+                }
+                let t = self.infer_expr(&args[0])?;
+                if !matches!(t, Ty::Int | Ty::Unknown) {
+                    return Err(err(Msg::IndexNotInt, span));
+                }
+                Ok(inner.clone())
+            }
+            "set" => {
+                if args.len() != 2 {
+                    return Err(err(Msg::ArgCount("List.set".into(), 2, args.len()), span));
+                }
+                let t = self.infer_expr(&args[0])?;
+                if !matches!(t, Ty::Int | Ty::Unknown) {
+                    return Err(err(Msg::IndexNotInt, span));
+                }
+                let v = self.infer_expr_consume(&args[1], span)?;
+                if !self.is_compatible(inner, &v) && !matches!(inner, Ty::Unknown) {
+                    return Err(err(
+                        Msg::ArgTypeMismatch {
+                            func: "List.set".into(),
+                            index: 1,
+                            expected: inner.name(),
+                            actual: v.name(),
+                        },
+                        span,
+                    ));
+                }
+                self.borrow_var_transient(obj, true, span)?;
+                Ok(Ty::Unit)
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "List".into(),
+                    method: name.to_string(),
+                },
+                span,
+            )),
+        }
+    }
+
+    fn check_functions(&mut self) -> Result<(), TypeError> {
+        for item in &self.program.items {
+            if let Item::Fn(f) = item {
+                self.check_fn_body(f)?;
+            }
+            if let Item::Impl(imp) = item {
+                self.check_impl_body(imp)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_impl_body(&mut self, imp: &ImplDef) -> Result<(), TypeError> {
+        // Impl methods run with `self` bound as the struct type.
+        let self_ty = Ty::Struct(imp.ty.clone());
+        for m in &imp.methods {
+            self.vars.push(HashMap::new());
+            self.current_fn = Some(format!("{}::{}", imp.ty, m.name));
+            let sig = self
+                .method_sig(m, &imp.ty, imp.span)
+                .expect("method signature parsed during collect_impls");
+            for (p, (pname, pty)) in m.params.iter().zip(&sig.params) {
+                let _ = p;
+                self.bind(pname.clone(), pty.clone());
+            }
+            let _ = self_ty.clone();
+            let result = self.check_block(&m.body);
+            self.current_fn = None;
+            self.vars.pop();
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Whether `actual` can be used where `expected` is declared.
+    /// `Struct` implements `Interface` when an `impl T: I` exists.
+    fn is_compatible(&self, expected: &Ty, actual: &Ty) -> bool {
+        if matches!(expected, Ty::Unknown) || matches!(actual, Ty::Unknown) {
+            return true;
+        }
+        if expected == actual {
+            return true;
+        }
+        match (expected, actual) {
+            (Ty::Interface(i), Ty::Struct(s)) => {
+                self.impls.get(s).is_some_and(|ifaces| ifaces.contains(i))
+            }
+            _ => false,
+        }
+    }
+}
+
+fn types_compatible(expected: &Ty, actual: &Ty) -> bool {
+    if matches!(expected, Ty::Unknown) || matches!(actual, Ty::Unknown) {
+        return true;
+    }
+    expected == actual
+}
+
+fn op_str(op: BinOp) -> &'static str {
+    use BinOp::*;
+    match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
+        And => "and",
+        Or => "or",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sole_parser::parse;
+
+    fn check_ok(src: &str) {
+        let p = parse(src).expect("parse");
+        check(&p).expect("typecheck");
+    }
+
+    fn check_err(src: &str) -> String {
+        let p = parse(src).expect("parse");
+        match check(&p) {
+            Ok(()) => panic!("expected type error for:\n{}", src),
+            Err(e) => e.diag.render(Lang::En),
+        }
+    }
+
+    // ---- M1: basics ----
+
+    #[test]
+    fn annotated_let_matches_literal() {
+        check_ok("let x: int = 42\n");
+        check_ok("let x: float = 1.5\n");
+        check_ok("let x: bool = true\n");
+        check_ok("let x: str = \"hi\"\n");
+    }
+
+    #[test]
+    fn annotated_let_mismatch_is_an_error() {
+        let msg = check_err("let x: int = \"hi\"\n");
+        assert_eq!(
+            msg,
+            "1:1: [E0301] type mismatch in `let x`: expected `int`, got `str`"
+        );
+    }
+
+    #[test]
+    fn unannotated_let_infers_and_checks_assign() {
+        check_ok("let x = 1\nx = 2\n");
+        let msg = check_err("let x = 1\nx = \"hi\"\n");
+        assert_eq!(
+            msg,
+            "2:1: [E0302] type mismatch in assignment to `x`: expected `int`, got `str`"
+        );
+    }
+
+    #[test]
+    fn assign_to_undefined_variable_is_an_error() {
+        let msg = check_err("x = 1\n");
+        assert_eq!(msg, "1:1: [E0201] undefined variable `x`");
+    }
+
+    #[test]
+    fn call_arg_types_are_checked() {
+        check_ok("fn f(a: int) -> int:\n    return a\nprint(f(1))\n");
+        let msg = check_err("fn f(a: int) -> int:\n    return a\nprint(f(\"hi\"))\n");
+        assert_eq!(
+            msg,
+            "3:8: [E0303] type mismatch in argument 1 of `f`: expected `int`, got `str`"
+        );
+    }
+
+    #[test]
+    fn call_arg_count_is_checked() {
+        let msg = check_err("fn f(a: int) -> int:\n    return a\nprint(f())\n");
+        assert_eq!(msg, "3:8: [E0211] function `f` expects 1 arguments, got 0");
+    }
+
+    #[test]
+    fn return_type_is_checked() {
+        check_ok("fn f(a: int) -> int:\n    return a\n");
+        let msg = check_err("fn f(a: int) -> int:\n    return \"hi\"\n");
+        assert_eq!(
+            msg,
+            "2:5: [E0304] type mismatch in return of `f`: expected `int`, got `str`"
+        );
+    }
+
+    #[test]
+    fn operator_types_are_checked() {
+        check_ok("print(1 + 2)\n");
+        check_ok("print(\"a\" + \"b\")\n");
+        check_ok("print(1 + 2.5)\n");
+        check_ok("print(1 == 1)\n");
+        check_ok("print(true and false)\n");
+        let msg = check_err("print(1 + \"hi\")\n");
+        assert_eq!(
+            msg,
+            "1:9: [E0305] operator `+` does not support type `int and str`"
+        );
+        let msg = check_err("print(1 == \"hi\")\n");
+        assert!(msg.contains("[E0305]"));
+    }
+
+    #[test]
+    fn conditions_must_be_truthy_types() {
+        check_ok("if true:\n    print(1)\n");
+        check_ok("while 0:\n    break\n");
+        let msg = check_err("fn f() -> int:\n    return 1\nif f:\n    print(1)\n");
+        assert!(msg.contains("[E0305]"));
+    }
+
+    #[test]
+    fn for_iterable_must_be_range() {
+        check_ok("for i in range(3):\n    print(i)\n");
+        let msg = check_err("for i in 5:\n    print(i)\n");
+        assert!(msg.contains("[E0305]"));
+    }
+
+    #[test]
+    fn undefined_variable_in_expr_is_an_error() {
+        let msg = check_err("print(x)\n");
+        assert_eq!(msg, "1:7: [E0201] undefined variable `x`");
+    }
+
+    #[test]
+    fn recursive_and_mutual_functions_pass() {
+        check_ok(
+            "fn fib(n: int) -> int:\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n",
+        );
+    }
+
+    #[test]
+    fn unknown_types_are_skipped_not_rejected() {
+        let msg = check_err("let x: Foo = 42\n");
+        assert!(msg.contains("[E0306]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn condition_position_in_error() {
+        let msg = check_err("let x: bool = 1\n");
+        assert_eq!(
+            msg,
+            "1:1: [E0301] type mismatch in `let x`: expected `bool`, got `int`"
+        );
+    }
+
+    // ---- M2: List ----
+
+    #[test]
+    fn list_literals_and_types() {
+        check_ok("let xs: List[int] = [1, 2, 3]\n");
+        check_ok("let xs = [1, 2, 3]\n");
+        let msg = check_err("let xs: List[int] = [1, \"hi\"]\n");
+        assert!(msg.contains("[E0312]"), "msg: {msg}");
+        let msg = check_err("let xs = []\n");
+        assert!(msg.contains("[E0313]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn list_indexing() {
+        check_ok("let xs = [1, 2]\nprint(xs[0])\n");
+        let msg = check_err("let xs = [1, 2]\nprint(xs[\"a\"])\n");
+        assert!(msg.contains("[E0315]"), "msg: {msg}");
+        let msg = check_err("let x = 5\nprint(x[0])\n");
+        assert!(msg.contains("[E0314]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn list_methods() {
+        check_ok("let xs = [1]\nxs.push(2)\nprint(xs.len())\nprint(xs.get(0))\nxs.set(0, 9)\n");
+        let msg = check_err("let xs: List[int] = [1]\nxs.push(\"hi\")\n");
+        assert!(msg.contains("[E0303]"), "msg: {msg}");
+        let msg = check_err("let xs = [1]\nxs.unknown_method()\n");
+        assert!(msg.contains("[E0309]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn for_over_list() {
+        check_ok("let xs = [1, 2, 3]\nfor x in xs:\n    print(x)\n");
+        check_ok("let xs = [1, 2, 3]\nfor x in ref xs:\n    print(x)\nprint(xs.len())\n");
+        let msg = check_err("for x in 5:\n    print(x)\n");
+        assert!(msg.contains("[E0305]"), "msg: {msg}");
+    }
+
+    // ---- M2: move semantics ----
+
+    #[test]
+    fn use_after_move_is_an_error() {
+        let msg = check_err("let a = [1, 2]\nlet b = a\nprint(a.len())\n");
+        assert_eq!(
+            msg,
+            "3:7: [E0401] use of moved value `a` (move it back or borrow instead)"
+        );
+    }
+
+    #[test]
+    fn copy_types_are_not_moved() {
+        check_ok("let a = 1\nlet b = a\nprint(a)\n");
+        check_ok("let a = \"s\"\nlet b = a\nprint(a)\n");
+    }
+
+    #[test]
+    fn move_into_function_call() {
+        check_ok("fn consume(xs: List[int]) -> int:\n    return xs.len()\nlet xs = [1]\nprint(consume(xs))\n");
+        let msg = check_err(
+            "fn consume(xs: List[int]) -> int:\n    return xs.len()\nlet xs = [1]\nprint(consume(xs))\nprint(xs.len())\n",
+        );
+        assert!(msg.contains("[E0401]"), "msg: {msg}");
+    }
+
+    // ---- M2: borrows ----
+
+    #[test]
+    fn ref_parameter_does_not_move() {
+        check_ok(
+            "fn len(xs: ref List[int]) -> int:\n    return xs.len()\nlet xs = [1, 2]\nprint(len(xs))\nprint(xs.len())\n",
+        );
+    }
+
+    #[test]
+    fn mut_ref_parameter_can_mutate() {
+        check_ok(
+            "fn bump(xs: mut ref List[int]) -> int:\n    xs.push(1)\n    return 0\nlet mut xs = [1]\nbump(xs)\nprint(xs.len())\n",
+        );
+    }
+
+    #[test]
+    fn explicit_ref_borrows_are_persistent() {
+        check_ok("let a = [1, 2]\nlet r = ref a\nprint(r.len())\n");
+        let msg = check_err("let a = [1, 2]\nlet r = ref a\nlet b = a\n");
+        assert!(msg.contains("[E0402]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn mutable_borrow_conflicts() {
+        let msg = check_err("let a = [1, 2]\nlet r1 = ref a\nlet r2 = mut ref a\n");
+        assert!(msg.contains("[E0403]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn borrow_escape_is_an_error() {
+        let msg = check_err("fn f() -> ref int:\n    let x = 5\n    return ref x\n");
+        assert_eq!(
+            msg,
+            "3:5: [E0404] cannot return a reference to a local value (it would dangle)"
+        );
+    }
+
+    #[test]
+    fn returning_a_reference_parameter_is_allowed() {
+        check_ok("fn first(xs: ref List[int]) -> ref List[int]:\n    return xs\n");
+        check_ok("struct Box:\n    v: int\nfn get(b: ref Box) -> ref int:\n    return ref b.v\n");
+    }
+
+    // ---- M2: structs, interfaces, methods ----
+
+    #[test]
+    fn struct_construction_and_fields() {
+        check_ok(
+            "struct Point:\n    x: int\n    y: int\nlet p = Point(1, 2)\nprint(p.x)\nprint(p.y)\n",
+        );
+        let msg = check_err("struct Point:\n    x: int\nlet p = Point(1)\nprint(p.z)\n");
+        assert!(msg.contains("[E0308]"), "msg: {msg}");
+        let msg = check_err("struct Point:\n    x: int\n    y: int\nlet p = Point(1, \"a\")\n");
+        assert!(msg.contains("[E0303]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn struct_construction_arg_count() {
+        let msg = check_err("struct Point:\n    x: int\nlet p = Point(1, 2, 3)\n");
+        assert!(msg.contains("[E0211]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn interface_implementation_checked() {
+        let src = "interface Shape:\n    fn area(self: ref Shape) -> float\nstruct Circle:\n    r: float\nimpl Circle: Shape:\n    fn area(self: ref Circle) -> float:\n        return 3.14 * self.r * self.r\nlet c = Circle(2.0)\nprint(c.area())\n";
+        check_ok(src);
+    }
+
+    #[test]
+    fn missing_impl_method_is_an_error() {
+        let msg = check_err("interface Shape:\n    fn area(self: ref Shape) -> float\nstruct Circle:\n    r: float\nimpl Circle: Shape:\n    fn perimeter(self: ref Circle) -> float:\n        return 2.0\n");
+        assert!(msg.contains("[E0311]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn interface_type_accepts_implementing_struct() {
+        let src = "interface Shape:\n    fn area(self: ref Shape) -> float\nstruct Circle:\n    r: float\nimpl Circle: Shape:\n    fn area(self: ref Circle) -> float:\n        return 3.14 * self.r * self.r\nfn describe(s: ref Shape) -> float:\n    return s.area()\nlet c = Circle(1.0)\nprint(describe(ref c))\n";
+        check_ok(src);
+    }
+
+    #[test]
+    fn method_requires_self() {
+        let msg = check_err(
+            "struct Point:\n    x: int\nimpl Point:\n    fn dist() -> int:\n        return 1\n",
+        );
+        assert!(msg.contains("[E0305]"), "msg: {msg}");
+    }
+
+    #[test]
+    fn unknown_method_is_an_error() {
+        let msg = check_err("struct Point:\n    x: int\nlet p = Point(1)\np.unknown()\n");
+        assert!(msg.contains("[E0309]"), "msg: {msg}");
+    }
+}

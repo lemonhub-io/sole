@@ -45,3 +45,36 @@ fn cli_bilingual_error_messages() {
     );
     assert!(zh_err.contains("[E0201] 未定义变量 `x`"), "zh: {}", zh_err);
 }
+
+#[test]
+fn cli_typecheck_error_is_bilingual() {
+    let path = std::env::temp_dir().join(format!("sole_type_{}.sole", std::process::id()));
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "let x: int = \"hi\"").unwrap();
+    drop(f);
+
+    let en = sole()
+        .args(["run", "--lang", "en", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let zh = sole()
+        .args(["run", "--lang", "zh", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!en.status.success());
+    assert!(!zh.status.success());
+    let en_err = String::from_utf8(en.stderr).unwrap();
+    let zh_err = String::from_utf8(zh.stderr).unwrap();
+    assert!(
+        en_err.contains("[E0301] type mismatch in `let x`"),
+        "en: {}",
+        en_err
+    );
+    assert!(
+        zh_err.contains("[E0301] `let x` 类型不匹配"),
+        "zh: {}",
+        zh_err
+    );
+}

@@ -4,6 +4,7 @@
 //! for the list of known simplifications.
 
 pub mod eval;
+pub mod typecheck;
 
 pub use sole_diag::Lang;
 
@@ -14,9 +15,10 @@ pub fn set_lang(lang: Lang) {
     sole_diag::set_override(Some(lang));
 }
 
-/// Runs Sole source code end-to-end: lex → parse → evaluate.
+/// Runs Sole source code end-to-end: lex → parse → typecheck → evaluate.
 pub fn run_source(source: &str) -> Result<(), String> {
     let program = parse(source).map_err(|e| e.to_string())?;
+    typecheck::check(&program).map_err(|e| e.to_string())?;
     let mut out = std::io::stdout();
     eval::run(&program, &mut out).map_err(|e| e.to_string())
 }
@@ -27,6 +29,7 @@ mod tests {
 
     fn run_with_output(source: &str) -> Result<String, String> {
         let program = parse(source).map_err(|e| e.to_string())?;
+        typecheck::check(&program).map_err(|e| e.to_string())?;
         let mut buf = Vec::new();
         eval::run(&program, &mut buf).map_err(|e| e.to_string())?;
         String::from_utf8(buf).map_err(|e| e.to_string())
@@ -105,5 +108,53 @@ print(sign(0))
     fn type_annotation_is_parsed_and_ignored_at_runtime() {
         let src = "let x: int = 42\nprint(x)\n";
         assert_eq!(run_with_output(src).unwrap(), "42\n");
+    }
+
+    #[test]
+    fn runtime_errors_have_source_position() {
+        let err = run_with_output("print(x)\n").unwrap_err();
+        assert!(
+            err.contains("1:7: [E0201] undefined variable `x`"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn typecheck_errors_have_stable_code_and_position() {
+        let err = run_with_output("let x: int = \"hi\"\n").unwrap_err();
+        assert_eq!(
+            err,
+            "1:1: [E0301] type mismatch in `let x`: expected `int`, got `str`"
+        );
+    }
+
+    #[test]
+    fn list_end_to_end() {
+        let src = "let xs: List[int] = [1, 2, 3]\nxs.push(4)\nprint(xs.len())\nprint(xs[0])\nprint(xs.get(3))\nxs.set(0, 9)\nprint(xs[0])\n";
+        assert_eq!(run_with_output(src).unwrap(), "4\n1\n4\n9\n");
+    }
+
+    #[test]
+    fn list_for_loop_borrow() {
+        let src = "let xs = [1, 2, 3]\nfor x in ref xs:\n    print(x)\nprint(xs.len())\n";
+        assert_eq!(run_with_output(src).unwrap(), "1\n2\n3\n3\n");
+    }
+
+    #[test]
+    fn borrow_parameter_end_to_end() {
+        let src = "fn sum(xs: ref List[int]) -> int:\n    let mut total = 0\n    for x in ref xs:\n        total = total + x\n    return total\nprint(sum([1, 2, 3]))\n";
+        assert_eq!(run_with_output(src).unwrap(), "6\n");
+    }
+
+    #[test]
+    fn struct_and_methods_end_to_end() {
+        let src = "struct Point:\n    x: int\n    y: int\nimpl Point:\n    fn move_x(self: mut ref Point, dx: int) -> int:\n        self.x = self.x + dx\n        return self.x\nlet mut p = Point(1, 2)\nprint(p.x)\nprint(p.y)\nprint(p.move_x(5))\n";
+        assert_eq!(run_with_output(src).unwrap(), "1\n2\n6\n");
+    }
+
+    #[test]
+    fn interface_dispatch_end_to_end() {
+        let src = "interface Shape:\n    fn area(self: ref Shape) -> float\nstruct Circle:\n    r: float\nimpl Circle: Shape:\n    fn area(self: ref Circle) -> float:\n        return 3.14 * self.r * self.r\nfn describe(s: ref Shape) -> float:\n    return s.area()\nlet c = Circle(1.0)\nprint(describe(ref c))\n";
+        assert_eq!(run_with_output(src).unwrap(), "3.14\n");
     }
 }

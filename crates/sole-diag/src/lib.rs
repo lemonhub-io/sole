@@ -96,6 +96,63 @@ pub enum Msg {
     CmpMismatch,
     InternalFnIndex,
     Io(String),
+    // Type checker (E03xx)
+    LetTypeMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+    AssignTypeMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+    ArgTypeMismatch {
+        func: String,
+        index: usize,
+        expected: String,
+        actual: String,
+    },
+    ReturnTypeMismatch {
+        func: String,
+        expected: String,
+        actual: String,
+    },
+    OpTypeMismatch {
+        op: String,
+        actual: String,
+    },
+    UnknownType(String),
+    UnknownStruct(String),
+    UnknownField {
+        ty: String,
+        field: String,
+    },
+    UnknownMethod {
+        ty: String,
+        method: String,
+    },
+    NotImpl {
+        ty: String,
+        interface: String,
+    },
+    MissingImplMethod {
+        interface: String,
+        method: String,
+    },
+    ListElemMismatch {
+        expected: String,
+        actual: String,
+    },
+    EmptyListNoType,
+    IndexOnNonList(String),
+    IndexNotInt,
+    // Borrow checker (E04xx)
+    UseAfterMove(String),
+    MoveWhileBorrowed(String),
+    MutBorrowConflict(String),
+    BorrowEscape,
+    UnknownBorrowTarget(String),
 }
 
 impl Msg {
@@ -137,6 +194,26 @@ impl Msg {
             Msg::CmpMismatch => "E0216",
             Msg::InternalFnIndex => "E0217",
             Msg::Io(_) => "E0218",
+            Msg::LetTypeMismatch { .. } => "E0301",
+            Msg::AssignTypeMismatch { .. } => "E0302",
+            Msg::ArgTypeMismatch { .. } => "E0303",
+            Msg::ReturnTypeMismatch { .. } => "E0304",
+            Msg::OpTypeMismatch { .. } => "E0305",
+            Msg::UnknownType(_) => "E0306",
+            Msg::UnknownStruct(_) => "E0307",
+            Msg::UnknownField { .. } => "E0308",
+            Msg::UnknownMethod { .. } => "E0309",
+            Msg::NotImpl { .. } => "E0310",
+            Msg::MissingImplMethod { .. } => "E0311",
+            Msg::ListElemMismatch { .. } => "E0312",
+            Msg::EmptyListNoType => "E0313",
+            Msg::IndexOnNonList(_) => "E0314",
+            Msg::IndexNotInt => "E0315",
+            Msg::UseAfterMove(_) => "E0401",
+            Msg::MoveWhileBorrowed(_) => "E0402",
+            Msg::MutBorrowConflict(_) => "E0403",
+            Msg::BorrowEscape => "E0404",
+            Msg::UnknownBorrowTarget(_) => "E0405",
         }
     }
 
@@ -206,6 +283,88 @@ impl Msg {
             Msg::CmpMismatch => "comparison type mismatch".into(),
             Msg::InternalFnIndex => "internal error: invalid function index".into(),
             Msg::Io(e) => format!("I/O error: {}", e),
+            Msg::LetTypeMismatch {
+                name,
+                expected,
+                actual,
+            } => format!(
+                "type mismatch in `let {}`: expected `{}`, got `{}`",
+                name, expected, actual
+            ),
+            Msg::AssignTypeMismatch {
+                name,
+                expected,
+                actual,
+            } => format!(
+                "type mismatch in assignment to `{}`: expected `{}`, got `{}`",
+                name, expected, actual
+            ),
+            Msg::ArgTypeMismatch {
+                func,
+                index,
+                expected,
+                actual,
+            } => format!(
+                "type mismatch in argument {} of `{}`: expected `{}`, got `{}`",
+                index + 1,
+                func,
+                expected,
+                actual
+            ),
+            Msg::ReturnTypeMismatch {
+                func,
+                expected,
+                actual,
+            } => format!(
+                "type mismatch in return of `{}`: expected `{}`, got `{}`",
+                func, expected, actual
+            ),
+            Msg::OpTypeMismatch { op, actual } => {
+                format!("operator `{}` does not support type `{}`", op, actual)
+            }
+            Msg::UnknownType(name) => format!("unknown type `{}`", name),
+            Msg::UnknownStruct(name) => format!("unknown struct `{}`", name),
+            Msg::UnknownField { ty, field } => {
+                format!("`{}` has no field `{}`", ty, field)
+            }
+            Msg::UnknownMethod { ty, method } => {
+                format!("`{}` has no method `{}`", ty, method)
+            }
+            Msg::NotImpl { ty, interface } => {
+                format!("`{}` does not implement interface `{}`", ty, interface)
+            }
+            Msg::MissingImplMethod { interface, method } => format!(
+                "implementation of `{}` is missing method `{}`",
+                interface, method
+            ),
+            Msg::ListElemMismatch { expected, actual } => format!(
+                "list element type mismatch: expected `{}`, got `{}`",
+                expected, actual
+            ),
+            Msg::EmptyListNoType => {
+                "empty list literal needs a type annotation (e.g. `let xs: List[int] = []`)".into()
+            }
+            Msg::IndexOnNonList(ty) => format!("cannot index a value of type `{}`", ty),
+            Msg::IndexNotInt => "list index must be an int".into(),
+            Msg::UseAfterMove(name) => {
+                format!(
+                    "use of moved value `{}` (move it back or borrow instead)",
+                    name
+                )
+            }
+            Msg::MoveWhileBorrowed(name) => format!(
+                "cannot move `{}` while it is borrowed (end the borrow first)",
+                name
+            ),
+            Msg::MutBorrowConflict(name) => {
+                format!("cannot borrow `{}` mutably: it is already borrowed", name)
+            }
+            Msg::BorrowEscape => {
+                "cannot return a reference to a local value (it would dangle)".into()
+            }
+            Msg::UnknownBorrowTarget(name) => {
+                format!("cannot borrow `{}`: not a variable", name)
+            }
         }
     }
 
@@ -261,6 +420,72 @@ impl Msg {
             Msg::CmpMismatch => "比较运算符类型不匹配".into(),
             Msg::InternalFnIndex => "内部错误: 函数索引无效".into(),
             Msg::Io(e) => format!("I/O 错误: {}", e),
+            Msg::LetTypeMismatch {
+                name,
+                expected,
+                actual,
+            } => format!(
+                "`let {}` 类型不匹配: 期望 `{}`,实际 `{}`",
+                name, expected, actual
+            ),
+            Msg::AssignTypeMismatch {
+                name,
+                expected,
+                actual,
+            } => format!(
+                "给 `{}` 赋值类型不匹配: 期望 `{}`,实际 `{}`",
+                name, expected, actual
+            ),
+            Msg::ArgTypeMismatch {
+                func,
+                index,
+                expected,
+                actual,
+            } => format!(
+                "`{}` 第 {} 个参数类型不匹配: 期望 `{}`,实际 `{}`",
+                func,
+                index + 1,
+                expected,
+                actual
+            ),
+            Msg::ReturnTypeMismatch {
+                func,
+                expected,
+                actual,
+            } => format!(
+                "`{}` 返回类型不匹配: 期望 `{}`,实际 `{}`",
+                func, expected, actual
+            ),
+            Msg::OpTypeMismatch { op, actual } => {
+                format!("运算符 `{}` 不支持类型 `{}`", op, actual)
+            }
+            Msg::UnknownType(name) => format!("未知类型 `{}`", name),
+            Msg::UnknownStruct(name) => format!("未知结构体 `{}`", name),
+            Msg::UnknownField { ty, field } => format!("`{}` 没有字段 `{}`", ty, field),
+            Msg::UnknownMethod { ty, method } => format!("`{}` 没有方法 `{}`", ty, method),
+            Msg::NotImpl { ty, interface } => {
+                format!("`{}` 未实现接口 `{}`", ty, interface)
+            }
+            Msg::MissingImplMethod { interface, method } => {
+                format!("`{}` 的实现缺少方法 `{}`", interface, method)
+            }
+            Msg::ListElemMismatch { expected, actual } => {
+                format!("列表元素类型不匹配: 期望 `{}`,实际 `{}`", expected, actual)
+            }
+            Msg::EmptyListNoType => "空列表字面量需要类型标注(如 `let xs: List[int] = []`)".into(),
+            Msg::IndexOnNonList(ty) => format!("不能对类型 `{}` 的值做下标访问", ty),
+            Msg::IndexNotInt => "列表下标必须是 int".into(),
+            Msg::UseAfterMove(name) => {
+                format!("使用了已移动的值 `{}`(改为移动回来或用借用)", name)
+            }
+            Msg::MoveWhileBorrowed(name) => {
+                format!("`{}` 被借用期间不能移动(先结束借用)", name)
+            }
+            Msg::MutBorrowConflict(name) => {
+                format!("不能可变借用 `{}`: 它已被借用", name)
+            }
+            Msg::BorrowEscape => "不能返回指向局部值的引用(会悬垂)".into(),
+            Msg::UnknownBorrowTarget(name) => format!("不能借用 `{}`: 不是变量", name),
         }
     }
 }

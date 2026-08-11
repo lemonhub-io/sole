@@ -7,6 +7,18 @@ use sole_diag::{Diagnostic, IdentKind, Lang, Msg};
 use sole_lexer::{Token, TokenKind};
 use std::fmt;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub line: usize,
+    pub column: usize,
+}
+
+impl Span {
+    pub fn new(line: usize, column: usize) -> Self {
+        Self { line, column }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,
@@ -15,6 +27,9 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Fn(FnDef),
+    Struct(StructDef),
+    Interface(InterfaceDef),
+    Impl(ImplDef),
     Stmt(Stmt),
 }
 
@@ -24,6 +39,35 @@ pub struct FnDef {
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceDef {
+    pub name: String,
+    pub methods: Vec<MethodSig>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodSig {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Option<Type>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplDef {
+    pub ty: String,
+    pub interface: Option<String>,
+    pub methods: Vec<FnDef>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,21 +96,34 @@ pub enum Stmt {
         is_mut: bool,
         ty: Option<Type>,
         value: Expr,
+        span: Span,
     },
     Assign {
         name: String,
         value: Expr,
+        span: Span,
+    },
+    FieldAssign {
+        obj: String,
+        field: String,
+        value: Expr,
+        span: Span,
     },
     Expr(Expr),
-    Return(Option<Expr>),
+    Return {
+        value: Option<Expr>,
+        span: Span,
+    },
     If {
         cond: Expr,
         then_block: Block,
         else_block: Option<ElseBranch>,
+        span: Span,
     },
     While {
         cond: Expr,
         body: Block,
+        span: Span,
     },
     For {
         var: String,
@@ -74,9 +131,31 @@ pub enum Stmt {
         mode: IterMode,
         iterable: Expr,
         body: Block,
+        span: Span,
     },
-    Break,
-    Continue,
+    Break {
+        span: Span,
+    },
+    Continue {
+        span: Span,
+    },
+}
+
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::FieldAssign { span, .. }
+            | Stmt::Return { span, .. }
+            | Stmt::If { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::For { span, .. }
+            | Stmt::Break { span }
+            | Stmt::Continue { span } => *span,
+            Stmt::Expr(e) => e.span(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,32 +173,62 @@ pub enum IterMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Int(i64),
-    Float(f64),
-    Str(String),
-    Bool(bool),
-    Ident(String),
+    Int(i64, Span),
+    Float(f64, Span),
+    Str(String, Span),
+    Bool(bool, Span),
+    Ident(String, Span),
+    List(Vec<Expr>, Span),
     Unary {
         op: UnOp,
         expr: Box<Expr>,
+        span: Span,
     },
     Binary {
         op: BinOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+        span: Span,
     },
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
+        span: Span,
     },
     Field {
         obj: Box<Expr>,
         name: String,
+        span: Span,
     },
     Index {
         obj: Box<Expr>,
         index: Box<Expr>,
+        span: Span,
     },
+    Borrow {
+        mutable: bool,
+        expr: Box<Expr>,
+        span: Span,
+    },
+}
+
+impl Expr {
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Int(_, s)
+            | Expr::Float(_, s)
+            | Expr::Str(_, s)
+            | Expr::Bool(_, s)
+            | Expr::Ident(_, s)
+            | Expr::List(_, s) => *s,
+            Expr::Unary { span, .. }
+            | Expr::Binary { span, .. }
+            | Expr::Call { span, .. }
+            | Expr::Field { span, .. }
+            | Expr::Index { span, .. }
+            | Expr::Borrow { span, .. } => *span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -190,7 +299,127 @@ impl<'a> Parser<'a> {
         if self.at(&TokenKind::Fn) {
             return self.parse_fn().map(Item::Fn);
         }
+        if self.at(&TokenKind::Struct) {
+            return self.parse_struct().map(Item::Struct);
+        }
+        if self.at(&TokenKind::Interface) {
+            return self.parse_interface().map(Item::Interface);
+        }
+        if self.at(&TokenKind::Impl) {
+            return self.parse_impl().map(Item::Impl);
+        }
         self.parse_stmt().map(Item::Stmt)
+    }
+
+    fn parse_struct(&mut self) -> Result<StructDef, ParseError> {
+        let span = self.here_span();
+        self.expect(&TokenKind::Struct, "struct")?;
+        let name = self.expect_ident(IdentKind::TypeName)?;
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
+        if !self.at(&TokenKind::Indent) {
+            return Err(self.err_here(Msg::ExpectedIndent));
+        }
+        self.advance();
+        let mut fields = Vec::new();
+        while !self.at(&TokenKind::Dedent) {
+            if self.at(&TokenKind::Eof) {
+                return Err(self.err_here(Msg::BlockNotClosed));
+            }
+            let field_name = self.expect_ident(IdentKind::FieldName)?;
+            self.expect(&TokenKind::Colon, ":")?;
+            let ty = self.parse_type()?;
+            self.expect_stmt_end()?;
+            fields.push((field_name, ty));
+        }
+        self.advance(); // consume Dedent
+        Ok(StructDef { name, fields, span })
+    }
+
+    fn parse_interface(&mut self) -> Result<InterfaceDef, ParseError> {
+        let span = self.here_span();
+        self.expect(&TokenKind::Interface, "interface")?;
+        let name = self.expect_ident(IdentKind::TypeName)?;
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
+        if !self.at(&TokenKind::Indent) {
+            return Err(self.err_here(Msg::ExpectedIndent));
+        }
+        self.advance();
+        let mut methods = Vec::new();
+        while !self.at(&TokenKind::Dedent) {
+            if self.at(&TokenKind::Eof) {
+                return Err(self.err_here(Msg::BlockNotClosed));
+            }
+            if !self.at(&TokenKind::Fn) {
+                return Err(self.err_here(Msg::ExpectedToken("fn".into())));
+            }
+            self.advance();
+            let method_name = self.expect_ident(IdentKind::FnName)?;
+            self.expect(&TokenKind::LParen, "(")?;
+            let mut params = Vec::new();
+            if !self.at(&TokenKind::RParen) {
+                loop {
+                    params.push(self.parse_param()?);
+                    if self.at(&TokenKind::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen, ")")?;
+            let ret = if self.at(&TokenKind::Arrow) {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            self.expect_stmt_end()?;
+            methods.push(MethodSig {
+                name: method_name,
+                params,
+                ret,
+            });
+        }
+        self.advance(); // consume Dedent
+        Ok(InterfaceDef {
+            name,
+            methods,
+            span,
+        })
+    }
+
+    fn parse_impl(&mut self) -> Result<ImplDef, ParseError> {
+        let span = self.here_span();
+        self.expect(&TokenKind::Impl, "impl")?;
+        let ty = self.expect_ident(IdentKind::TypeName)?;
+        let interface = if self.at(&TokenKind::Colon) && self.peek2() != Some(&TokenKind::Newline) {
+            self.advance();
+            Some(self.expect_ident(IdentKind::TypeName)?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
+        if !self.at(&TokenKind::Indent) {
+            return Err(self.err_here(Msg::ExpectedIndent));
+        }
+        self.advance();
+        let mut methods = Vec::new();
+        while !self.at(&TokenKind::Dedent) {
+            if self.at(&TokenKind::Eof) {
+                return Err(self.err_here(Msg::BlockNotClosed));
+            }
+            methods.push(self.parse_fn()?);
+        }
+        self.advance(); // consume Dedent
+        Ok(ImplDef {
+            ty,
+            interface,
+            methods,
+            span,
+        })
     }
 
     fn parse_fn(&mut self) -> Result<FnDef, ParseError> {
@@ -276,19 +505,28 @@ impl<'a> Parser<'a> {
             Some(TokenKind::Ident(_)) if self.peek2() == Some(&TokenKind::Eq) => {
                 self.parse_assign()
             }
+            Some(TokenKind::Ident(_))
+                if self.peek2() == Some(&TokenKind::Dot)
+                    && matches!(self.peek3(), Some(TokenKind::Ident(_)))
+                    && self.peek4() == Some(&TokenKind::Eq) =>
+            {
+                self.parse_field_assign()
+            }
             Some(TokenKind::Return) => self.parse_return(),
             Some(TokenKind::If) => self.parse_if(),
             Some(TokenKind::While) => self.parse_while(),
             Some(TokenKind::For) => self.parse_for(),
             Some(TokenKind::Break) => {
+                let span = self.here_span();
                 self.advance();
                 self.expect_stmt_end()?;
-                Ok(Stmt::Break)
+                Ok(Stmt::Break { span })
             }
             Some(TokenKind::Continue) => {
+                let span = self.here_span();
                 self.advance();
                 self.expect_stmt_end()?;
-                Ok(Stmt::Continue)
+                Ok(Stmt::Continue { span })
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -299,6 +537,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_let(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
         self.expect(&TokenKind::Let, "let")?;
         let is_mut = self.at(&TokenKind::Mut);
         if is_mut {
@@ -319,28 +558,48 @@ impl<'a> Parser<'a> {
             is_mut,
             ty,
             value,
+            span,
         })
     }
 
     fn parse_assign(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
         let name = self.expect_ident(IdentKind::VarName)?;
         self.expect(&TokenKind::Eq, "=")?;
         let value = self.parse_expr()?;
         self.expect_stmt_end()?;
-        Ok(Stmt::Assign { name, value })
+        Ok(Stmt::Assign { name, value, span })
+    }
+
+    fn parse_field_assign(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
+        let obj = self.expect_ident(IdentKind::VarName)?;
+        self.expect(&TokenKind::Dot, ".")?;
+        let field = self.expect_ident(IdentKind::FieldName)?;
+        self.expect(&TokenKind::Eq, "=")?;
+        let value = self.parse_expr()?;
+        self.expect_stmt_end()?;
+        Ok(Stmt::FieldAssign {
+            obj,
+            field,
+            value,
+            span,
+        })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
         self.expect(&TokenKind::Return, "return")?;
         let value = match self.peek_kind() {
             Some(TokenKind::Newline) | Some(TokenKind::Eof) => None,
             _ => Some(self.parse_expr()?),
         };
         self.expect_stmt_end()?;
-        Ok(Stmt::Return(value))
+        Ok(Stmt::Return { value, span })
     }
 
     fn parse_if(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
         self.expect(&TokenKind::If, "if")?;
         let cond = self.parse_expr()?;
         self.expect(&TokenKind::Colon, ":")?;
@@ -363,19 +622,22 @@ impl<'a> Parser<'a> {
             cond,
             then_block,
             else_block,
+            span,
         })
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
         self.expect(&TokenKind::While, "while")?;
         let cond = self.parse_expr()?;
         self.expect(&TokenKind::Colon, ":")?;
         self.expect_newline()?;
         let body = self.parse_block()?;
-        Ok(Stmt::While { cond, body })
+        Ok(Stmt::While { cond, body, span })
     }
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
         self.expect(&TokenKind::For, "for")?;
         let is_mut = self.at(&TokenKind::Mut);
         if is_mut {
@@ -403,6 +665,7 @@ impl<'a> Parser<'a> {
             mode,
             iterable,
             body,
+            span,
         })
     }
 
@@ -445,12 +708,14 @@ impl<'a> Parser<'a> {
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_and()?;
         while self.at(&TokenKind::Or) {
+            let span = self.here_span();
             self.advance();
             let rhs = self.parse_and()?;
             lhs = Expr::Binary {
                 op: BinOp::Or,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
+                span,
             };
         }
         Ok(lhs)
@@ -459,12 +724,14 @@ impl<'a> Parser<'a> {
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_cmp()?;
         while self.at(&TokenKind::And) {
+            let span = self.here_span();
             self.advance();
             let rhs = self.parse_cmp()?;
             lhs = Expr::Binary {
                 op: BinOp::And,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
+                span,
             };
         }
         Ok(lhs)
@@ -482,12 +749,14 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::Ge) => BinOp::Ge,
                 _ => break,
             };
+            let span = self.here_span();
             self.advance();
             let rhs = self.parse_add()?;
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
+                span,
             };
         }
         Ok(lhs)
@@ -501,12 +770,14 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::Minus) => BinOp::Sub,
                 _ => break,
             };
+            let span = self.here_span();
             self.advance();
             let rhs = self.parse_mul()?;
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
+                span,
             };
         }
         Ok(lhs)
@@ -521,12 +792,14 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::Percent) => BinOp::Mod,
                 _ => break,
             };
+            let span = self.here_span();
             self.advance();
             let rhs = self.parse_unary()?;
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
+                span,
             };
         }
         Ok(lhs)
@@ -535,19 +808,44 @@ impl<'a> Parser<'a> {
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         match self.peek_kind() {
             Some(TokenKind::Minus) => {
+                let span = self.here_span();
                 self.advance();
                 let expr = self.parse_unary()?;
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
                     expr: Box::new(expr),
+                    span,
                 })
             }
             Some(TokenKind::Not) => {
+                let span = self.here_span();
                 self.advance();
                 let expr = self.parse_unary()?;
                 Ok(Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(expr),
+                    span,
+                })
+            }
+            Some(TokenKind::Mut) if self.peek2() == Some(&TokenKind::Ref) => {
+                let span = self.here_span();
+                self.advance();
+                self.advance();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Borrow {
+                    mutable: true,
+                    expr: Box::new(expr),
+                    span,
+                })
+            }
+            Some(TokenKind::Ref) => {
+                let span = self.here_span();
+                self.advance();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Borrow {
+                    mutable: false,
+                    expr: Box::new(expr),
+                    span,
                 })
             }
             _ => self.parse_postfix(),
@@ -559,6 +857,7 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek_kind() {
                 Some(TokenKind::LParen) => {
+                    let span = self.here_span();
                     self.advance();
                     let mut args = Vec::new();
                     if !self.at(&TokenKind::RParen) {
@@ -575,23 +874,28 @@ impl<'a> Parser<'a> {
                     expr = Expr::Call {
                         callee: Box::new(expr),
                         args,
+                        span,
                     };
                 }
                 Some(TokenKind::LBracket) => {
+                    let span = self.here_span();
                     self.advance();
                     let index = self.parse_expr()?;
                     self.expect(&TokenKind::RBracket, "]")?;
                     expr = Expr::Index {
                         obj: Box::new(expr),
                         index: Box::new(index),
+                        span,
                     };
                 }
                 Some(TokenKind::Dot) => {
+                    let span = self.here_span();
                     self.advance();
                     let name = self.expect_ident(IdentKind::FieldName)?;
                     expr = Expr::Field {
                         obj: Box::new(expr),
                         name,
+                        span,
                     };
                 }
                 _ => break,
@@ -603,36 +907,59 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.peek_kind() {
             Some(TokenKind::Int(n)) => {
+                let span = self.here_span();
                 self.advance();
-                Ok(Expr::Int(n))
+                Ok(Expr::Int(n, span))
             }
             Some(TokenKind::Float(f)) => {
+                let span = self.here_span();
                 self.advance();
-                Ok(Expr::Float(f))
+                Ok(Expr::Float(f, span))
             }
             Some(TokenKind::Str(s)) => {
+                let span = self.here_span();
                 let s = s.clone();
                 self.advance();
-                Ok(Expr::Str(s))
+                Ok(Expr::Str(s, span))
             }
             Some(TokenKind::True) => {
+                let span = self.here_span();
                 self.advance();
-                Ok(Expr::Bool(true))
+                Ok(Expr::Bool(true, span))
             }
             Some(TokenKind::False) => {
+                let span = self.here_span();
                 self.advance();
-                Ok(Expr::Bool(false))
+                Ok(Expr::Bool(false, span))
             }
             Some(TokenKind::Ident(name)) => {
+                let span = self.here_span();
                 let name = name.clone();
                 self.advance();
-                Ok(Expr::Ident(name))
+                Ok(Expr::Ident(name, span))
             }
             Some(TokenKind::LParen) => {
                 self.advance();
                 let inner = self.parse_expr()?;
                 self.expect(&TokenKind::RParen, ")")?;
                 Ok(inner)
+            }
+            Some(TokenKind::LBracket) => {
+                let span = self.here_span();
+                self.advance();
+                let mut items = Vec::new();
+                if !self.at(&TokenKind::RBracket) {
+                    loop {
+                        items.push(self.parse_expr()?);
+                        if self.at(&TokenKind::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBracket, "]")?;
+                Ok(Expr::List(items, span))
             }
             _ => Err(self.err_here(Msg::ExpectedExpr)),
         }
@@ -650,6 +977,14 @@ impl<'a> Parser<'a> {
 
     fn peek2(&self) -> Option<&TokenKind> {
         self.tokens.get(self.pos + 1).map(|t| &t.kind)
+    }
+
+    fn peek3(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + 2).map(|t| &t.kind)
+    }
+
+    fn peek4(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + 3).map(|t| &t.kind)
     }
 
     fn advance(&mut self) {
@@ -700,6 +1035,13 @@ impl<'a> Parser<'a> {
         };
         ParseError {
             diag: Diagnostic::new(msg, line, column),
+        }
+    }
+
+    fn here_span(&self) -> Span {
+        match self.tokens.get(self.pos) {
+            Some(t) => Span::new(t.line, t.column),
+            None => Span::new(0, 0),
         }
     }
 }
