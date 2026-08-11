@@ -26,6 +26,7 @@ pub enum Ty {
     Fn,
     Unknown,
     List(Box<Ty>),
+    Chan(Box<Ty>),
     Struct(String),
     Interface(String),
     Ref(Box<Ty>),
@@ -33,6 +34,16 @@ pub enum Ty {
 }
 
 impl Ty {
+    fn from_name(name: &str) -> Option<Ty> {
+        match name {
+            "int" => Some(Ty::Int),
+            "float" => Some(Ty::Float),
+            "bool" => Some(Ty::Bool),
+            "str" => Some(Ty::Str),
+            _ => None,
+        }
+    }
+
     fn name(&self) -> String {
         match self {
             Ty::Int => "int".into(),
@@ -44,6 +55,7 @@ impl Ty {
             Ty::Fn => "fn".into(),
             Ty::Unknown => "?".into(),
             Ty::List(inner) => format!("List[{}]", inner.name()),
+            Ty::Chan(inner) => format!("Chan[{}]", inner.name()),
             Ty::Struct(name) => name.clone(),
             Ty::Interface(name) => name.clone(),
             Ty::Ref(inner) => format!("ref {}", inner.name()),
@@ -54,7 +66,14 @@ impl Ty {
     fn is_copy(&self) -> bool {
         matches!(
             self,
-            Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Ref(_) | Ty::Fn | Ty::Unknown
+            Ty::Int
+                | Ty::Float
+                | Ty::Bool
+                | Ty::Str
+                | Ty::Ref(_)
+                | Ty::Chan(_)
+                | Ty::Fn
+                | Ty::Unknown
         )
     }
 
@@ -104,13 +123,15 @@ enum State {
 struct Var {
     ty: Ty,
     state: State,
+    mutable: bool,
 }
 
 impl Var {
-    fn new(ty: Ty) -> Self {
+    fn new(ty: Ty, mutable: bool) -> Self {
         Self {
             ty,
             state: State::Live,
+            mutable,
         }
     }
 }
@@ -131,6 +152,9 @@ pub struct Checker<'a> {
     methods: HashMap<(String, String), FnSig>,
     vars: Vec<HashMap<String, Var>>,
     current_fn: Option<String>,
+    task_group_depth: usize,
+    /// Active persistent borrows: borrow variable → (target, mutable).
+    borrows: HashMap<String, (String, bool)>,
 }
 
 /// Checks a whole program for static type and borrow errors.
@@ -144,18 +168,25 @@ pub fn check(program: &Program) -> Result<(), TypeError> {
         methods: HashMap::new(),
         vars: Vec::new(),
         current_fn: None,
+        task_group_depth: 0,
+        borrows: HashMap::new(),
     };
     checker.collect_types()?;
     checker.collect_fns()?;
     checker.collect_impls()?;
     checker.check_interfaces()?;
     checker.vars.push(HashMap::new());
-    for item in &program.items {
-        match item {
-            Item::Fn(_) | Item::Struct(_) | Item::Interface(_) | Item::Impl(_) => {}
-            Item::Stmt(stmt) => checker.check_stmt(stmt)?,
-        }
-    }
+    // Top-level statements form an implicit block so that NLL borrow
+    // release applies there too.
+    let top_stmts: Vec<Stmt> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Stmt(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    checker.check_block(&Block { stmts: top_stmts })?;
     checker.vars.pop();
     checker.check_functions()?;
     Ok(())
@@ -223,6 +254,16 @@ impl<'a> Checker<'a> {
                         }
                         let inner = self.ty_of_type(&args[0], self_ty)?;
                         Ok(Ty::List(Box::new(inner)))
+                    }
+                    "Chan" => {
+                        if args.len() != 1 {
+                            return Err(err(
+                                Msg::ArgCount("Chan".into(), 1, args.len()),
+                                Span::new(0, 0),
+                            ));
+                        }
+                        let inner = self.ty_of_type(&args[0], self_ty)?;
+                        Ok(Ty::Chan(Box::new(inner)))
                     }
                     _ => {
                         if args.is_empty() && self.structs.contains_key(name) {
@@ -373,9 +414,9 @@ impl<'a> Checker<'a> {
         None
     }
 
-    fn bind(&mut self, name: String, ty: Ty) {
+    fn bind(&mut self, name: String, ty: Ty, mutable: bool) {
         if let Some(scope) = self.vars.last_mut() {
-            scope.insert(name, Var::new(ty));
+            scope.insert(name, Var::new(ty, mutable));
         }
     }
 
@@ -487,11 +528,30 @@ impl<'a> Checker<'a> {
         })
     }
 
-    /// Resolves a borrow target to its root variable and (for field
-    /// borrows) the field's type.
+    /// Resolves a borrow target to its root variable and (for field/index
+    /// borrows) the borrowed type.
     fn borrow_path(&self, target: &Expr) -> Result<(String, Option<Ty>), TypeError> {
         match target {
             Expr::Ident(name, _) => Ok((name.clone(), None)),
+            Expr::Index { obj, index, span } => {
+                let Expr::Ident(root, _) = obj.as_ref() else {
+                    return Err(err(Msg::UnknownBorrowTarget("non-variable".into()), *span));
+                };
+                let Some(v) = self.lookup(root) else {
+                    return Err(err(Msg::UndefinedVariable(root.clone()), *span));
+                };
+                let base = v.ty.deref().clone();
+                match &base {
+                    Ty::List(inner) => {
+                        let _ = index;
+                        Ok((root.clone(), Some(inner.as_ref().clone())))
+                    }
+                    other => Err(err(
+                        Msg::UnknownBorrowTarget(other.name()),
+                        *span,
+                    )),
+                }
+            }
             Expr::Field { obj, name, span } => {
                 let Expr::Ident(root, _) = obj.as_ref() else {
                     return Err(err(Msg::UnknownBorrowTarget("non-variable".into()), *span));
@@ -536,7 +596,7 @@ impl<'a> Checker<'a> {
         self.vars.push(HashMap::new());
         self.current_fn = Some(f.name.clone());
         for (p, ty) in f.params.iter().zip(&sig.params) {
-            self.bind(p.name.clone(), ty.1.clone());
+            self.bind(p.name.clone(), ty.1.clone(), p.is_mut);
         }
         let result = self.check_block(&f.body);
         self.current_fn = None;
@@ -544,8 +604,8 @@ impl<'a> Checker<'a> {
         result
     }
 
-    /// Checks a block. Borrows created inside the block are released at its
-    /// end (lexical borrow regions); borrows that existed on entry (outer
+    /// Checks a block. Persistent borrows are released at the last use of
+    /// their borrow variable (NLL); borrows that existed on entry (outer
     /// borrows) survive the block. Reference-typed variables created inside
     /// the block die with it.
     fn check_block(&mut self, block: &Block) -> Result<(), TypeError> {
@@ -554,8 +614,16 @@ impl<'a> Checker<'a> {
             .last()
             .map(|scope| scope.iter().map(|(k, v)| (k.clone(), v.state)).collect())
             .unwrap_or_default();
-        for stmt in &block.stmts {
+        // NLL: last-use position of every variable in this block.
+        let mut last_uses: HashMap<String, usize> = HashMap::new();
+        for (idx, stmt) in block.stmts.iter().enumerate() {
+            collect_uses(stmt, &mut last_uses, idx);
+        }
+        // Borrows created outside this block must not be released by it.
+        let outer_borrows: Vec<String> = self.borrows.keys().cloned().collect();
+        for (idx, stmt) in block.stmts.iter().enumerate() {
             self.check_stmt(stmt)?;
+            self.release_dead_borrows(&last_uses, idx, &outer_borrows);
         }
         if let Some(scope) = self.vars.last_mut() {
             for (name, var) in scope.iter_mut() {
@@ -580,15 +648,55 @@ impl<'a> Checker<'a> {
         Ok(())
     }
 
+    /// Releases borrows whose borrow variable is no longer used after the
+    /// given statement index (NLL). Only borrows created inside the current
+    /// block are released; outer borrows survive nested blocks.
+    fn release_dead_borrows(
+        &mut self,
+        last_uses: &HashMap<String, usize>,
+        stmt_idx: usize,
+        outer_borrows: &[String],
+    ) {
+        let dead: Vec<String> = self
+            .borrows
+            .keys()
+            .filter(|r| {
+                !outer_borrows.contains(r)
+                    && last_uses.get(*r).copied().unwrap_or(0) <= stmt_idx
+            })
+            .cloned()
+            .collect();
+        for r in dead {
+            let Some((target, _)) = self.borrows.remove(&r) else {
+                continue;
+            };
+            // Only release the target when no other borrow variable uses it.
+            let still_borrowed = self.borrows.values().any(|(t, _)| *t == target);
+            if !still_borrowed {
+                if let Some(v) = self.lookup_mut(&target) {
+                    v.state = State::Live;
+                }
+            }
+        }
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) -> Result<(), TypeError> {
         match stmt {
             Stmt::Let {
                 name,
-                is_mut: _,
+                is_mut,
                 ty,
                 value,
                 span,
             } => {
+                // `let r = ref x` registers a persistent borrow that NLL
+                // releases at r's last use.
+                if let Expr::Borrow { expr, mutable, .. } = value {
+                    if let Ok((target, _)) = self.borrow_path(expr) {
+                        self.borrows
+                            .insert(name.clone(), (target, *mutable));
+                    }
+                }
                 // Annotated list: check each element against the inner type,
                 // which also allows heterogenous struct elements when the
                 // annotation is an interface type.
@@ -607,7 +715,7 @@ impl<'a> Checker<'a> {
                                 ));
                             }
                         }
-                        self.bind(name.clone(), expected);
+                        self.bind(name.clone(), expected, *is_mut);
                         return Ok(());
                     }
                 }
@@ -625,17 +733,24 @@ impl<'a> Checker<'a> {
                                 *span,
                             ));
                         }
-                        self.bind(name.clone(), expected);
+                        self.bind(name.clone(), expected, *is_mut);
                     }
-                    None => self.bind(name.clone(), actual),
+                    None => self.bind(name.clone(), actual, *is_mut),
                 }
                 Ok(())
             }
             Stmt::Assign { name, value, span } => {
-                let expected = self
+                let var = self
                     .lookup(name)
-                    .map(|v| v.ty.clone())
+                    .cloned()
                     .ok_or_else(|| err(Msg::UndefinedVariable(name.clone()), *span))?;
+                if !var.mutable {
+                    return Err(err(
+                        Msg::ImmutableReassign(name.clone()),
+                        *span,
+                    ));
+                }
+                let expected = var.ty;
                 let actual = self.infer_expr_consume_skip(value, *span, name)?;
                 if !self.is_compatible(&expected, &actual) {
                     return Err(err(
@@ -780,7 +895,7 @@ impl<'a> Checker<'a> {
             }
             Stmt::For {
                 var,
-                is_mut: _,
+                is_mut,
                 mode,
                 iterable,
                 body,
@@ -820,7 +935,7 @@ impl<'a> Checker<'a> {
                         elem
                     }
                 };
-                self.bind(var.clone(), elem_ty);
+                self.bind(var.clone(), elem_ty, *is_mut);
                 self.check_block(body)?;
                 // Release the borrow on the iterable (D6: usable after loop).
                 if let Expr::Ident(name, _) = iterable {
@@ -831,6 +946,30 @@ impl<'a> Checker<'a> {
                 Ok(())
             }
             Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
+            Stmt::TaskGroup { body, span } => {
+                // `go` is only allowed inside a task_group (or the implicit
+                // top-level group). Track the current task-group depth.
+                let _ = span;
+                self.task_group_depth += 1;
+                let result = self.check_block(body);
+                self.task_group_depth -= 1;
+                result
+            }
+            Stmt::Go { call, span } => {
+                // `go` must spawn a call expression.
+                if !matches!(call.as_ref(), Expr::Call { .. }) {
+                    return Err(err(
+                        Msg::OpTypeMismatch {
+                            op: "go".into(),
+                            actual: "expected a call expression".into(),
+                        },
+                        *span,
+                    ));
+                }
+                self.infer_expr(call)?;
+                Ok(())
+            }
+            Stmt::Yield { .. } => Ok(()),
         }
     }
 
@@ -838,6 +977,7 @@ impl<'a> Checker<'a> {
         match t {
             Ty::Range => Ok(Ty::Int),
             Ty::List(inner) => Ok(inner.as_ref().clone()),
+            Ty::Chan(inner) => Ok(inner.as_ref().clone()),
             Ty::Unknown => Ok(Ty::Unknown),
             other => Err(err(
                 Msg::OpTypeMismatch {
@@ -1109,6 +1249,38 @@ impl<'a> Checker<'a> {
         if let Expr::Field { obj, name, .. } = callee {
             return self.infer_method(obj, name, args, span);
         }
+        // Channel construction: `Chan[int]()` / `Chan[int](10)`.
+        if let Expr::Index { obj, index, .. } = callee {
+            if let Expr::Ident(cname, _) = obj.as_ref() {
+                if cname == "Chan" {
+                    let elem_name = match index.as_ref() {
+                        Expr::Ident(n, _) => n.clone(),
+                        _ => return Err(err(Msg::UnknownType("<chan elem>".into()), span)),
+                    };
+                    let elem = Ty::from_name(&elem_name).ok_or_else(|| {
+                        err(Msg::UnknownType(elem_name.clone()), span)
+                    })?;
+                    if args.len() > 1 {
+                        return Err(err(Msg::ArgCount("Chan".into(), 1, args.len()), span));
+                    }
+                    if let Some(a) = args.first() {
+                        let t = self.infer_expr(a)?;
+                        if !matches!(t, Ty::Int | Ty::Unknown) {
+                            return Err(err(
+                                Msg::ArgTypeMismatch {
+                                    func: "Chan".into(),
+                                    index: 0,
+                                    expected: "int".into(),
+                                    actual: t.name(),
+                                },
+                                span,
+                            ));
+                        }
+                    }
+                    return Ok(Ty::Chan(Box::new(elem)));
+                }
+            }
+        }
         if let Expr::Ident(name, _) = callee {
             match name.as_str() {
                 "print" => {
@@ -1266,6 +1438,7 @@ impl<'a> Checker<'a> {
         let base = obj_ty.deref().clone();
         match &base {
             Ty::List(inner) => self.infer_list_method(obj, inner, name, args, span),
+            Ty::Chan(inner) => self.infer_chan_method(obj, inner, name, args, span),
             Ty::Struct(sname) => {
                 if let Some(sig) = self
                     .methods
@@ -1449,6 +1622,56 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `Chan[T]` methods: `send(v)`, `recv() -> Option[T]`, `close()`.
+    fn infer_chan_method(
+        &mut self,
+        _obj: &Expr,
+        inner: &Ty,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        match name {
+            "send" => {
+                if args.len() != 1 {
+                    return Err(err(Msg::ArgCount("Chan.send".into(), 1, args.len()), span));
+                }
+                let t = self.infer_expr_consume(&args[0], span)?;
+                if !self.is_compatible(inner, &t) && !matches!(inner, Ty::Unknown) {
+                    return Err(err(
+                        Msg::ArgTypeMismatch {
+                            func: "Chan.send".into(),
+                            index: 0,
+                            expected: inner.name(),
+                            actual: t.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok(Ty::Unit)
+            }
+            "recv" => {
+                if !args.is_empty() {
+                    return Err(err(Msg::ArgCount("Chan.recv".into(), 0, args.len()), span));
+                }
+                Ok(Ty::Unknown) // Option[T] is not modeled in M3; treat as inner.
+            }
+            "close" => {
+                if !args.is_empty() {
+                    return Err(err(Msg::ArgCount("Chan.close".into(), 0, args.len()), span));
+                }
+                Ok(Ty::Unit)
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "Chan".into(),
+                    method: name.to_string(),
+                },
+                span,
+            )),
+        }
+    }
+
     fn check_functions(&mut self) -> Result<(), TypeError> {
         for item in &self.program.items {
             if let Item::Fn(f) = item {
@@ -1471,8 +1694,7 @@ impl<'a> Checker<'a> {
                 .method_sig(m, &imp.ty, imp.span)
                 .expect("method signature parsed during collect_impls");
             for (p, (pname, pty)) in m.params.iter().zip(&sig.params) {
-                let _ = p;
-                self.bind(pname.clone(), pty.clone());
+                self.bind(pname.clone(), pty.clone(), p.is_mut);
             }
             let _ = self_ty.clone();
             let result = self.check_block(&m.body);
@@ -1506,6 +1728,108 @@ fn types_compatible(expected: &Ty, actual: &Ty) -> bool {
         return true;
     }
     expected == actual
+}
+
+/// Records the last statement index at which each variable is used (NLL).
+/// Nested blocks use the enclosing statement's index, which is conservative:
+/// borrows may outlive their NLL point by one statement, never the reverse.
+fn collect_uses(stmt: &Stmt, uses: &mut HashMap<String, usize>, idx: usize) {
+    fn expr_uses(expr: &Expr, uses: &mut HashMap<String, usize>, idx: usize) {
+        match expr {
+            Expr::Ident(name, _) => {
+                uses.insert(name.clone(), idx);
+            }
+            Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) => {}
+            Expr::List(items, _) => {
+                for it in items {
+                    expr_uses(it, uses, idx);
+                }
+            }
+            Expr::Unary { expr, .. } => expr_uses(expr, uses, idx),
+            Expr::Binary { lhs, rhs, .. } => {
+                expr_uses(lhs, uses, idx);
+                expr_uses(rhs, uses, idx);
+            }
+            Expr::Call { callee, args, .. } => {
+                expr_uses(callee, uses, idx);
+                for a in args {
+                    expr_uses(a, uses, idx);
+                }
+            }
+            Expr::Field { obj, name, .. } => {
+                expr_uses(obj, uses, idx);
+                uses.insert(name.clone(), idx);
+            }
+            Expr::Index { obj, index, .. } => {
+                expr_uses(obj, uses, idx);
+                expr_uses(index, uses, idx);
+            }
+            Expr::Borrow { expr, .. } => expr_uses(expr, uses, idx),
+        }
+    }
+
+    fn block_uses(block: &Block, uses: &mut HashMap<String, usize>, idx: usize) {
+        for s in &block.stmts {
+            collect_uses(s, uses, idx);
+        }
+    }
+
+    match stmt {
+        Stmt::Let { value, name, .. } => {
+            // The binding name is a definition, not a use.
+            let _ = name;
+            expr_uses(value, uses, idx);
+        }
+        Stmt::Assign { name, value, .. } => {
+            uses.insert(name.clone(), idx);
+            expr_uses(value, uses, idx);
+        }
+        Stmt::FieldAssign {
+            obj, field, value, ..
+        } => {
+            uses.insert(obj.clone(), idx);
+            uses.insert(field.clone(), idx);
+            expr_uses(value, uses, idx);
+        }
+        Stmt::Expr(expr) => expr_uses(expr, uses, idx),
+        Stmt::Return { value, .. } => {
+            if let Some(v) = value {
+                expr_uses(v, uses, idx);
+            }
+        }
+        Stmt::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            expr_uses(cond, uses, idx);
+            block_uses(then_block, uses, idx);
+            if let Some(ElseBranch::If(s)) = else_block {
+                collect_uses(s, uses, idx);
+            }
+            if let Some(ElseBranch::Block(b)) = else_block {
+                block_uses(b, uses, idx);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            expr_uses(cond, uses, idx);
+            block_uses(body, uses, idx);
+        }
+        Stmt::For {
+            var,
+            iterable,
+            body,
+            ..
+        } => {
+            let _ = var;
+            expr_uses(iterable, uses, idx);
+            block_uses(body, uses, idx);
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Yield { .. } => {}
+        Stmt::TaskGroup { body, .. } => block_uses(body, uses, idx),
+        Stmt::Go { call, .. } => expr_uses(call, uses, idx),
+    }
 }
 
 fn op_str(op: BinOp) -> &'static str {
@@ -1566,8 +1890,8 @@ mod tests {
 
     #[test]
     fn unannotated_let_infers_and_checks_assign() {
-        check_ok("let x = 1\nx = 2\n");
-        let msg = check_err("let x = 1\nx = \"hi\"\n");
+        check_ok("let mut x = 1\nx = 2\n");
+        let msg = check_err("let mut x = 1\nx = \"hi\"\n");
         assert_eq!(
             msg,
             "2:1: [E0302] type mismatch in assignment to `x`: expected `int`, got `str`"
@@ -1747,14 +2071,18 @@ mod tests {
 
     #[test]
     fn explicit_ref_borrows_are_persistent() {
-        check_ok("let a = [1, 2]\nlet r = ref a\nprint(r.len())\n");
-        let msg = check_err("let a = [1, 2]\nlet r = ref a\nlet b = a\n");
+        // NLL: borrow lives until the borrow variable's last use.
+        // Move while the borrow variable is still alive → error.
+        let msg = check_err("let a = [1, 2]\nlet r = ref a\nlet b = a\nprint(r.len())\n");
         assert!(msg.contains("[E0402]"), "msg: {msg}");
+        // Move after the borrow variable's last use → allowed.
+        check_ok("let a = [1, 2]\nlet r = ref a\nprint(r.len())\nlet b = a\nprint(b.len())\n");
     }
 
     #[test]
     fn mutable_borrow_conflicts() {
-        let msg = check_err("let a = [1, 2]\nlet r1 = ref a\nlet r2 = mut ref a\n");
+        // r1 alive when r2 is created → conflict.
+        let msg = check_err("let a = [1, 2]\nlet r1 = ref a\nlet r2 = mut ref a\nprint(r1.len())\n");
         assert!(msg.contains("[E0403]"), "msg: {msg}");
     }
 
@@ -1771,7 +2099,10 @@ mod tests {
 
     #[test]
     fn outer_borrow_survives_blocks() {
-        let msg = check_err("let a = [1, 2]\nlet r = ref a\nif true:\n    print(1)\nlet b = a\n");
+        // r's last use is after the block; a move right after it is fine (NLL).
+        check_ok("let a = [1, 2]\nlet r = ref a\nif true:\n    print(1)\nprint(r.len())\nlet b = a\nprint(b.len())\n");
+        // r still alive (used later) → move is an error.
+        let msg = check_err("let a = [1, 2]\nlet r = ref a\nif true:\n    print(r.len())\nlet b = a\nprint(r.len())\n");
         assert!(msg.contains("[E0402]"), "msg: {msg}");
     }
 

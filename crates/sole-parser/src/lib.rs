@@ -139,6 +139,17 @@ pub enum Stmt {
     Continue {
         span: Span,
     },
+    TaskGroup {
+        body: Block,
+        span: Span,
+    },
+    Go {
+        call: Box<Expr>,
+        span: Span,
+    },
+    Yield {
+        span: Span,
+    },
 }
 
 impl Stmt {
@@ -152,7 +163,10 @@ impl Stmt {
             | Stmt::While { span, .. }
             | Stmt::For { span, .. }
             | Stmt::Break { span }
-            | Stmt::Continue { span } => *span,
+            | Stmt::Continue { span }
+            | Stmt::TaskGroup { span, .. }
+            | Stmt::Go { span, .. }
+            | Stmt::Yield { span } => *span,
             Stmt::Expr(e) => e.span(),
         }
     }
@@ -516,6 +530,14 @@ impl<'a> Parser<'a> {
             Some(TokenKind::If) => self.parse_if(),
             Some(TokenKind::While) => self.parse_while(),
             Some(TokenKind::For) => self.parse_for(),
+            Some(TokenKind::TaskGroup) => self.parse_task_group(),
+            Some(TokenKind::Go) => self.parse_go(),
+            Some(TokenKind::Yield) => {
+                let span = self.here_span();
+                self.advance();
+                self.expect_stmt_end()?;
+                Ok(Stmt::Yield { span })
+            }
             Some(TokenKind::Break) => {
                 let span = self.here_span();
                 self.advance();
@@ -671,6 +693,26 @@ impl<'a> Parser<'a> {
 
     /// Parses an indented block. The caller must already have consumed
     /// the `:` and the newline.
+    fn parse_task_group(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
+        self.expect(&TokenKind::TaskGroup, "task_group")?;
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::TaskGroup { body, span })
+    }
+
+    fn parse_go(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.here_span();
+        self.expect(&TokenKind::Go, "go")?;
+        let call = self.parse_expr()?;
+        self.expect_stmt_end()?;
+        Ok(Stmt::Go {
+            call: Box::new(call),
+            span,
+        })
+    }
+
     fn parse_block(&mut self) -> Result<Block, ParseError> {
         if self.at(&TokenKind::Indent) {
             self.advance();

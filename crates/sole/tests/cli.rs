@@ -86,6 +86,7 @@ fn cli_borrow_error_is_bilingual() {
     writeln!(f, "let a = [1, 2]").unwrap();
     writeln!(f, "let r = ref a").unwrap();
     writeln!(f, "let b = a").unwrap();
+    writeln!(f, "print(r.len())").unwrap();
     drop(f);
 
     let en = sole()

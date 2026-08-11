@@ -1,26 +1,33 @@
-//! The `sole` crate: CLI entry point and the M1 tree-walking interpreter.
+//! The `sole` crate: CLI entry point and the M3 bytecode VM runtime.
 //!
-//! M1 semantics are provisional by design; see docs/GOALS.md and the README
-//! for the list of known simplifications.
+//! Semantics follow docs/GOALS.md; see the README for known simplifications.
 
-pub mod eval;
+pub mod compiler;
 pub mod typecheck;
+pub mod vm;
 
 pub use sole_diag::Lang;
 
 use sole_parser::parse;
+use std::rc::Rc;
 
 /// Overrides the effective error-message language for this process.
 pub fn set_lang(lang: Lang) {
     sole_diag::set_override(Some(lang));
 }
 
-/// Runs Sole source code end-to-end: lex → parse → typecheck → evaluate.
+/// Runs Sole source code end-to-end: lex → parse → typecheck → compile → run.
 pub fn run_source(source: &str) -> Result<(), String> {
+    run_source_to(source, &mut std::io::stdout())
+}
+
+/// Like `run_source` but writes output to the given writer.
+pub fn run_source_to(source: &str, out: &mut dyn std::io::Write) -> Result<(), String> {
     let program = parse(source).map_err(|e| e.to_string())?;
     typecheck::check(&program).map_err(|e| e.to_string())?;
-    let mut out = std::io::stdout();
-    eval::run(&program, &mut out).map_err(|e| e.to_string())
+    let compiled = compiler::compile(&program).map_err(|e| e.to_string())?;
+    let mut rt = vm::Runtime::new(Rc::new(compiled), out);
+    rt.run().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -30,8 +37,10 @@ mod tests {
     fn run_with_output(source: &str) -> Result<String, String> {
         let program = parse(source).map_err(|e| e.to_string())?;
         typecheck::check(&program).map_err(|e| e.to_string())?;
+        let compiled = compiler::compile(&program).map_err(|e| e.to_string())?;
         let mut buf = Vec::new();
-        eval::run(&program, &mut buf).map_err(|e| e.to_string())?;
+        let mut rt = vm::Runtime::new(Rc::new(compiled), &mut buf);
+        rt.run().map_err(|e| e.to_string())?;
         String::from_utf8(buf).map_err(|e| e.to_string())
     }
 
@@ -168,5 +177,23 @@ print(sign(0))
     fn ref_parameter_does_not_copy() {
         let src = "fn bump(xs: ref List[int]) -> int:\n    return xs.len()\nlet data = [1, 2, 3]\nprint(bump(data))\nprint(data.len())\n";
         assert_eq!(run_with_output(src).unwrap(), "3\n3\n");
+    }
+
+    #[test]
+    fn channel_send_recv_end_to_end() {
+        let src = "fn worker(ch: Chan[int], n: int) -> int:\n    ch.send(n)\n    ch.send(n * 2)\n    return 0\ntask_group:\n    let ch = Chan[int]()\n    go worker(ch, 10)\n    let a = ch.recv()\n    let b = ch.recv()\n    print(a)\n    print(b)\n";
+        assert_eq!(run_with_output(src).unwrap(), "10\n20\n");
+    }
+
+    #[test]
+    fn channel_for_in_end_to_end() {
+        let src = "fn producer(ch: Chan[int], n: int) -> int:\n    for i in range(n):\n        ch.send(i)\n    ch.close()\n    return 0\ntask_group:\n    let ch = Chan[int](2)\n    go producer(ch, 5)\n    let mut sum = 0\n    for v in ch:\n        sum = sum + v\n    print(sum)\n";
+        assert_eq!(run_with_output(src).unwrap(), "10\n");
+    }
+
+    #[test]
+    fn buffered_channel_end_to_end() {
+        let src = "fn worker(ch: Chan[int]) -> int:\n    ch.send(1)\n    ch.send(2)\n    ch.send(3)\n    return 0\ntask_group:\n    let ch = Chan[int](3)\n    go worker(ch)\n    print(ch.recv())\n    print(ch.recv())\n    print(ch.recv())\n";
+        assert_eq!(run_with_output(src).unwrap(), "1\n2\n3\n");
     }
 }
