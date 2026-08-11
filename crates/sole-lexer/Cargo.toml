@@ -3,3 +3,6 @@ name = "sole-lexer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+sole-diag = { path = "../sole-diag" }
