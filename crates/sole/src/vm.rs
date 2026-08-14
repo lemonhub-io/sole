@@ -13,20 +13,22 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StructVal {
+    pub name: String,
+    pub fields: Vec<(String, Value)>,
+}
+
+/// Runtime value. Sized so the common variants stay small (24 bytes total):
+/// `str` is reference-counted (immutable, shared) and structs are boxed.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(String),
-    Range {
-        start: i64,
-        end: i64,
-    },
+    Str(Rc<str>),
+    Range { start: i64, end: i64 },
     List(Rc<RefCell<Vec<Value>>>),
-    Struct {
-        name: String,
-        fields: Vec<(String, Value)>,
-    },
+    Struct(Box<StructVal>),
     Chan(Rc<RefCell<Channel>>),
     Ref(Rc<RefCell<Value>>),
     MutRef(Rc<RefCell<Value>>),
@@ -70,7 +72,7 @@ impl Value {
             Value::Str(_) => "str",
             Value::Range { .. } => "Range",
             Value::List(_) => "List",
-            Value::Struct { .. } => "struct",
+            Value::Struct(_) => "struct",
             Value::Chan(_) => "Chan",
             Value::Ref(_) | Value::MutRef(_) => "ref",
             Value::Fn(_) => "fn",
@@ -159,7 +161,7 @@ pub struct Function {
 pub struct CompiledProgram {
     pub functions: Vec<Function>,
     pub globals: Vec<String>,
-    pub strings: Vec<String>,
+    pub strings: Vec<Rc<str>>,
     /// (struct type name, method name) 闂?function index.
     pub methods: Vec<((String, String), usize)>,
     /// struct name 闂?field names (construction order).
@@ -189,11 +191,16 @@ fn err(msg: Msg, line: usize, column: usize) -> VmError {
     }
 }
 
-/// A stack frame: function index, return address, local cells.
+/// A stack frame: function index, return address, local values.
+///
+/// Locals are plain values; a slot only gets an `Rc<RefCell>` cell when it is
+/// actually borrowed (`ref`/`mut ref`) or passed by cell (`PushVarCell`), so
+/// the common case never allocates per local.
 pub struct Frame {
     pub func: usize,
     pub ret: usize,
-    pub locals: Vec<Rc<RefCell<Value>>>,
+    pub locals: Vec<Value>,
+    pub cells: Vec<Option<Rc<RefCell<Value>>>>,
 }
 #[derive(Default)]
 pub struct Task {
@@ -222,7 +229,7 @@ pub enum TaskState {
 pub struct Runtime<'a> {
     pub prog: Rc<CompiledProgram>,
     pub channels: Vec<Rc<RefCell<Channel>>>,
-    pub tasks: Vec<Task>,
+    pub tasks: Vec<Option<Box<Task>>>,
     pub task_states: Vec<TaskState>,
     /// group id 闂?set of task ids in it (not yet finished).
     pub groups: Vec<Vec<usize>>,
@@ -312,27 +319,24 @@ impl<'a> Runtime<'a> {
     /// Creates a new task running function `func` with `args`.
     fn spawn(&mut self, func: usize, args: Vec<Value>, group: usize) -> usize {
         let f = &self.prog.functions[func];
-        let mut locals = Vec::with_capacity(f.nlocals as usize);
-        for a in args {
-            locals.push(Rc::new(RefCell::new(a)));
-        }
-        while locals.len() < f.nlocals as usize {
-            locals.push(Rc::new(RefCell::new(Value::Unit)));
-        }
+        let mut locals = args;
+        locals.resize(f.nlocals as usize, Value::Unit);
+        let cells = Vec::new();
         let id = self.tasks.len();
-        self.tasks.push(Task {
+        self.tasks.push(Some(Box::new(Task {
             ip: 0,
             stack: Vec::new(),
             frames: vec![Frame {
                 func,
                 ret: 0,
                 locals,
+                cells,
             }],
             group,
             done: false,
             iters: Vec::new(),
             groups: Vec::new(),
-        });
+        })));
         self.task_states.push(TaskState::Ready);
         if group < self.groups.len() {
             self.groups[group].push(id);
@@ -341,8 +345,8 @@ impl<'a> Runtime<'a> {
     }
 
     /// Cooperative scheduler: runs tasks round-robin until none are ready.
+    /// Each ready task runs until it blocks, yields, or finishes (GOALS §7.3).
     fn schedule_all(&mut self) -> Result<(), VmError> {
-        let mut rounds = 0;
         loop {
             let mut progressed = false;
             let n = self.tasks.len();
@@ -350,22 +354,15 @@ impl<'a> Runtime<'a> {
             while i < n {
                 if self.task_states[i] == TaskState::Ready {
                     self.current = i;
-                    let step = self.step_task(i)?;
-                    progressed |= step;
+                    progressed |= self.run_task(i)?;
                     if self.task_states[i] == TaskState::Done {
                         self.finish_task(i);
                     }
                 }
                 i += 1;
             }
-            rounds += 1;
-            if rounds > 100_000_000 {
-                return Err(err(Msg::InternalFnIndex, 0, 0));
-            }
             if !progressed {
-                // All tasks blocked or done. If any task is blocked forever
-                // with no possible progress, we would spin; instead treat
-                // leftover ready tasks as done.
+                // All tasks blocked or done.
                 break;
             }
         }
@@ -374,7 +371,7 @@ impl<'a> Runtime<'a> {
 
     fn finish_task(&mut self, id: usize) {
         self.task_states[id] = TaskState::Done;
-        let group = self.tasks[id].group;
+        let group = self.tasks[id].as_ref().unwrap().group;
         if group < self.groups.len() {
             self.groups[group].retain(|&t| t != id);
             // If the group is now empty, wake tasks waiting on its end.
@@ -393,711 +390,760 @@ impl<'a> Runtime<'a> {
         }
     }
 
-    /// Executes one step of task `id`; returns whether it made progress.
-    /// The task is taken out of the registry for the duration of the step
-    /// so that `&mut self` (channels, globals, scheduler) stays usable.
-    fn step_task(&mut self, id: usize) -> Result<bool, VmError> {
-        let mut task = std::mem::take(&mut self.tasks[id]);
-        let result = self.step_task_inner(&mut task, id);
+    /// Runs task `id` until it blocks, yields, or finishes; returns whether
+    /// it executed at least one instruction. The task is taken out of the
+    /// registry for the duration of the run so that `&mut self` (channels,
+    /// globals, scheduler) stays usable.
+    fn run_task(&mut self, id: usize) -> Result<bool, VmError> {
+        let mut task = self.tasks[id].take().unwrap();
+        let result = self.run_task_inner(&mut task, id);
         if task.done && self.task_states[id] != TaskState::Done {
             self.task_states[id] = TaskState::Done;
         }
-        self.tasks[id] = task;
+        self.tasks[id] = Some(task);
         result
     }
 
-    fn step_task_inner(&mut self, task: &mut Task, id: usize) -> Result<bool, VmError> {
+    fn run_task_inner(&mut self, task: &mut Task, id: usize) -> Result<bool, VmError> {
         let prog = self.prog.clone();
-        // Pop the current instruction; borrow issues are avoided by cloning
-        // the code slice index and re-borrowing per instruction.
-        let Some(frame) = task.frames.last() else {
-            task.done = true;
-            return Ok(false);
-        };
-        let func = &prog.functions[frame.func];
-        if task.ip >= func.code.len() {
-            task.done = true;
-            return Ok(false);
-        }
-        let instr = func.code[task.ip].clone();
-        task.ip += 1;
-        match instr {
-            Instr::Halt => {
+        // Run until the task blocks, yields, or finishes (GOALS §7.3:
+        // cooperative switching happens only at channel operations and
+        // `yield`). The dispatch loop stays hot; the scheduler and the
+        // per-run prologue are amortized over many instructions.
+        let mut budget = 100_000_000usize;
+        loop {
+            budget -= 1;
+            if budget == 0 {
+                return Err(err(Msg::InternalFnIndex, 0, 0));
+            }
+            let Some(frame) = task.frames.last() else {
                 task.done = true;
-                Ok(true)
+                break;
+            };
+            let func = &prog.functions[frame.func];
+            if task.ip >= func.code.len() {
+                task.done = true;
+                break;
             }
-            Instr::PushInt(n) => {
-                task.stack.push(Value::Int(n));
-                Ok(true)
-            }
-            Instr::PushFloat(f) => {
-                task.stack.push(Value::Float(f));
-                Ok(true)
-            }
-            Instr::PushBool(b) => {
-                task.stack.push(Value::Bool(b));
-                Ok(true)
-            }
-            Instr::PushStr(i) => {
-                task.stack
-                    .push(Value::Str(prog.strings[i as usize].clone()));
-                Ok(true)
-            }
-            Instr::PushUnit => {
-                task.stack.push(Value::Unit);
-                Ok(true)
-            }
-            Instr::PushVar(i) => {
-                let v = task.frames.last().unwrap().locals[i as usize]
-                    .borrow()
-                    .clone();
-                task.stack.push(v);
-                Ok(true)
-            }
-            Instr::PushVarCell(i) => {
-                let cell = task.frames.last().unwrap().locals[i as usize].clone();
-                // If the variable already holds a reference, pass it through.
-                let cur = cell.borrow().clone();
-                let cell = match cur {
-                    Value::Ref(inner) | Value::MutRef(inner) => inner,
-                    _ => cell,
-                };
-                task.stack.push(Value::Ref(cell));
-                Ok(true)
-            }
-            Instr::PushGlobal(i) => {
-                let name = &prog.globals[i as usize];
-                let v = self.global_value(name);
-                task.stack.push(v);
-                Ok(true)
-            }
-            Instr::StoreVar(i) => {
-                let v = task.stack.pop().unwrap_or(Value::Unit);
-                let cell = task.frames.last().unwrap().locals[i as usize].clone();
-                let cur = cell.borrow().clone();
-                match cur {
-                    Value::MutRef(target) => {
-                        *target.borrow_mut() = v;
-                    }
-                    Value::Ref(_) => {
-                        return Err(err(Msg::ImmutableReassign("<ref>".into()), 0, 0));
-                    }
-                    _ => {
-                        *cell.borrow_mut() = v;
-                    }
-                }
-                Ok(true)
-            }
-            Instr::StoreGlobal(i) => {
-                let v = task.stack.pop().unwrap_or(Value::Unit);
-                let name = prog.globals[i as usize].clone();
-                self.set_global(&name, v)?;
-                Ok(true)
-            }
-            Instr::BorrowVar(mutable, i) => {
-                let cell = task.frames.last().unwrap().locals[i as usize].clone();
-                if mutable {
-                    task.stack.push(Value::MutRef(cell));
-                } else {
-                    task.stack.push(Value::Ref(cell));
-                }
-                Ok(true)
-            }
-            Instr::MakeList(n) => {
-                let mut items = Vec::with_capacity(n as usize);
-                for _ in 0..n {
-                    items.push(task.stack.pop().unwrap_or(Value::Unit));
-                }
-                items.reverse();
-                task.stack.push(Value::List(Rc::new(RefCell::new(items))));
-                Ok(true)
-            }
-            Instr::ListLen => {
-                let list = task.stack.pop().unwrap_or(Value::Unit);
-                let len = match list {
-                    Value::List(items) => items.borrow().len(),
-                    _ => 0,
-                };
-                task.stack.push(Value::Int(len as i64));
-                Ok(true)
-            }
-            Instr::ListGet => {
-                let idx = task.stack.pop().unwrap_or(Value::Int(0));
-                let list = task.stack.pop().unwrap_or(Value::Unit);
-                let Value::Int(i) = idx else {
-                    return Err(err(Msg::IndexNotInt, 0, 0));
-                };
-                let item = match list {
-                    Value::List(items) => items
-                        .borrow()
-                        .get(i as usize)
-                        .cloned()
-                        .unwrap_or(Value::Unit),
-                    _ => return Err(err(Msg::IndexOnNonList(list.type_tag().into()), 0, 0)),
-                };
-                task.stack.push(item);
-                Ok(true)
-            }
-            Instr::ListSet => {
-                let v = task.stack.pop().unwrap_or(Value::Unit);
-                let idx = task.stack.pop().unwrap_or(Value::Int(0));
-                let list = task.stack.pop().unwrap_or(Value::Unit);
-                let Value::Int(i) = idx else {
-                    return Err(err(Msg::IndexNotInt, 0, 0));
-                };
-                match list {
-                    Value::List(items) => {
-                        let mut items = items.borrow_mut();
-                        if (i as usize) < items.len() {
-                            items[i as usize] = v;
-                        }
-                    }
-                    other => return Err(err(Msg::IndexOnNonList(other.type_tag().into()), 0, 0)),
-                }
-                task.stack.push(Value::Unit);
-                Ok(true)
-            }
-            Instr::IndexGet => {
-                let idx = task.stack.pop().unwrap_or(Value::Int(0));
-                let obj = task.stack.pop().unwrap_or(Value::Unit).deref();
-                let Value::Int(i) = idx else {
-                    return Err(err(Msg::IndexNotInt, 0, 0));
-                };
-                let v = match obj {
-                    Value::List(items) => items
-                        .borrow()
-                        .get(i as usize)
-                        .cloned()
-                        .unwrap_or(Value::Unit),
-                    other => return Err(err(Msg::IndexOnNonList(other.type_tag().into()), 0, 0)),
-                };
-                task.stack.push(v);
-                Ok(true)
-            }
-            Instr::MakeStruct(si) => {
-                let (name, fields) = prog.structs[si as usize].clone();
-                let mut values = Vec::with_capacity(fields.len());
-                for _ in 0..fields.len() {
-                    values.push(task.stack.pop().unwrap_or(Value::Unit));
-                }
-                values.reverse();
-                let fields: Vec<(String, Value)> = fields.into_iter().zip(values).collect();
-                task.stack.push(Value::Struct { name, fields });
-                Ok(true)
-            }
-            Instr::GetField(f) => {
-                let obj = task.stack.pop().unwrap_or(Value::Unit);
-                let field = prog.strings[f as usize].clone();
-                let obj = obj.deref();
-                let v = match obj {
-                    Value::Struct { fields, .. } => fields
-                        .iter()
-                        .find(|(n, _)| *n == field)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(Value::Unit),
-                    other => {
-                        return Err(err(
-                            Msg::UnknownField {
-                                ty: other.type_tag().into(),
-                                field,
-                            },
-                            0,
-                            0,
-                        ))
-                    }
-                };
-                task.stack.push(v);
-                Ok(true)
-            }
-            Instr::SetField(f) => {
-                let v = task.stack.pop().unwrap_or(Value::Unit);
-                let obj = task.stack.pop().unwrap_or(Value::Unit);
-                let field = prog.strings[f as usize].clone();
-                // If the receiver is a shared cell, mutate through it.
-                match obj {
-                    Value::Ref(cell) | Value::MutRef(cell) => {
-                        let mut cur = cell.borrow_mut();
-                        match &mut *cur {
-                            Value::Struct { fields, .. } => {
-                                if let Some(slot) = fields.iter_mut().find(|(n, _)| *n == field) {
-                                    slot.1 = v;
-                                }
-                                task.stack.push(Value::Unit);
-                                Ok(true)
-                            }
-                            other => Err(err(
-                                Msg::UnknownField {
-                                    ty: other.type_tag().into(),
-                                    field,
-                                },
-                                0,
-                                0,
-                            )),
-                        }
-                    }
-                    obj => {
-                        let obj = obj.deref();
-                        match obj {
-                            Value::Struct { name, mut fields } => {
-                                if let Some(slot) = fields.iter_mut().find(|(n, _)| *n == field) {
-                                    slot.1 = v;
-                                }
-                                task.stack.push(Value::Struct { name, fields });
-                                Ok(true)
-                            }
-                            other => Err(err(
-                                Msg::UnknownField {
-                                    ty: other.type_tag().into(),
-                                    field,
-                                },
-                                0,
-                                0,
-                            )),
-                        }
-                    }
-                }
-            }
-            Instr::Call(fi) => {
-                let f = &prog.functions[fi as usize];
-                let mut args = Vec::with_capacity(f.nparams as usize);
-                for _ in 0..f.nparams {
-                    args.push(task.stack.pop().unwrap_or(Value::Unit));
-                }
-                args.reverse();
-                let mut locals = Vec::with_capacity(f.nlocals as usize);
-                for a in args {
-                    locals.push(Rc::new(RefCell::new(a)));
-                }
-                while locals.len() < f.nlocals as usize {
-                    locals.push(Rc::new(RefCell::new(Value::Unit)));
-                }
-                let ret = task.ip;
-                task.frames.push(Frame {
-                    func: fi as usize,
-                    ret,
-                    locals: locals.clone(),
-                });
-                task.ip = 0;
-                Ok(true)
-            }
-            Instr::CallMethod(m) => {
-                let method = prog.strings[m as usize].clone();
-                // Find the method implementation by runtime struct type.
-                // Stack layout: [receiver, arg1, ..., argN].
-                let recv = task.stack.first().cloned().unwrap_or(Value::Unit);
-                let ty = match recv.deref() {
-                    Value::Struct { name, .. } => name,
-                    Value::List(_) => {
-                        let argc = match method.as_str() {
-                            "len" => 1,
-                            "push" | "get" => 2,
-                            "set" => 3,
-                            _ => {
-                                return Err(err(
-                                    Msg::UnknownMethod {
-                                        ty: "List".into(),
-                                        method,
-                                    },
-                                    0,
-                                    0,
-                                ))
-                            }
-                        };
-                        let args = collect_args(&mut task.stack, argc)?;
-                        let recv = args[0].deref();
-                        return self.list_method(&mut task.stack, recv, &method, &args[1..]);
-                    }
-                    Value::Chan(_) => {
-                        let argc = match method.as_str() {
-                            "send" => 2,
-                            "recv" | "close" => 1,
-                            _ => {
-                                return Err(err(
-                                    Msg::UnknownMethod {
-                                        ty: "Chan".into(),
-                                        method,
-                                    },
-                                    0,
-                                    0,
-                                ))
-                            }
-                        };
-                        let args = collect_args(&mut task.stack, argc)?;
-                        let recv = args[0].deref();
-                        let blocked =
-                            self.chan_method(&mut task.stack, recv, &method, &args[1..], id)?;
-                        if !blocked && method == "recv" {
-                            // Blocked recv: retry CallMethod after being woken
-                            // by re-executing it (args restored on the stack).
-                            task.ip = task.ip.saturating_sub(1);
-                            for a in args.iter().rev() {
-                                task.stack.push(a.clone());
-                            }
-                        }
-                        return Ok(blocked);
-                    }
-                    other => {
-                        return Err(err(
-                            Msg::UnknownMethod {
-                                ty: other.type_tag().into(),
-                                method,
-                            },
-                            0,
-                            0,
-                        ))
-                    }
-                };
-                let Some(&fi) = prog
-                    .methods
-                    .iter()
-                    .find(|((t, n), _)| t == &ty && n == &method)
-                    .map(|(_, i)| i)
-                else {
-                    return Err(err(
-                        Msg::UnknownMethod {
-                            ty: ty.clone(),
-                            method,
-                        },
-                        0,
-                        0,
-                    ));
-                };
-                let f = &prog.functions[fi];
-                let argc = f.nparams as usize;
-                let mut args = Vec::with_capacity(argc);
-                for _ in 0..argc {
-                    args.push(task.stack.pop().unwrap_or(Value::Unit));
-                }
-                args.reverse();
-                let mut locals = Vec::with_capacity(f.nlocals as usize);
-                for a in args {
-                    locals.push(Rc::new(RefCell::new(a)));
-                }
-                while locals.len() < f.nlocals as usize {
-                    locals.push(Rc::new(RefCell::new(Value::Unit)));
-                }
-                let ret = task.ip;
-                task.frames.push(Frame {
-                    func: fi,
-                    ret,
-                    locals,
-                });
-                task.ip = 0;
-                Ok(true)
-            }
-            Instr::BuiltinPrint(n) => {
-                let mut parts = Vec::with_capacity(n as usize);
-                for _ in 0..n {
-                    parts.push(task.stack.pop().unwrap_or(Value::Unit));
-                }
-                parts.reverse();
-                let line = parts
-                    .iter()
-                    .map(|v| v.display())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                writeln!(self.out, "{}", line).map_err(|e| err(Msg::Io(e.to_string()), 0, 0))?;
-                task.stack.push(Value::Unit);
-                Ok(true)
-            }
-            Instr::BuiltinRange => {
-                let end = task.stack.pop().unwrap_or(Value::Int(0));
-                let start = task.stack.pop().unwrap_or(Value::Int(0));
-                let (Value::Int(s), Value::Int(e)) = (start, end) else {
-                    return Err(err(Msg::RangeNotInt, 0, 0));
-                };
-                task.stack.push(Value::Range { start: s, end: e });
-                Ok(true)
-            }
-            Instr::Return => {
-                let v = task.stack.pop().unwrap_or(Value::Unit);
-                let done = task.frames.len() == 1;
-                let ret = task.frames.pop().map(|f| f.ret).unwrap_or(0);
-                if !done {
-                    task.ip = ret;
-                } else {
+            let instr = &func.code[task.ip];
+            task.ip += 1;
+            match instr {
+                Instr::Halt => {
                     task.done = true;
                 }
-                task.stack.push(v);
-                Ok(true)
-            }
-            Instr::Jump(target) => {
-                task.ip = target as usize;
-                Ok(true)
-            }
-            Instr::JumpIfFalse(target) => {
-                let v = task.stack.pop().unwrap_or(Value::Bool(false));
-                if !truthy(&v) {
-                    task.ip = target as usize;
+                Instr::PushInt(n) => {
+                    task.stack.push(Value::Int(*n));
                 }
-                Ok(true)
-            }
-            Instr::ForInit => {
-                let it = task.stack.pop().unwrap_or(Value::Unit);
-                let iter = match it {
-                    Value::Range { start, end } => IterState::Range { cur: start, end },
-                    Value::List(items) => IterState::List { items, idx: 0 },
-                    Value::Chan(chan) => IterState::Chan { chan },
-                    other => return Err(err(Msg::ForNotSupported(other.type_tag().into()), 0, 0)),
-                };
-                task.iters.push(iter);
-                Ok(true)
-            }
-            Instr::ForNext(target) => {
-                // Take the top iterator out so we can also touch the stack.
-                let Some(iter) = task.iters.pop() else {
-                    task.ip = target as usize;
-                    return Ok(true);
-                };
-                match iter {
-                    IterState::Range { mut cur, end } => {
-                        if cur < end {
-                            let v = Value::Int(cur);
-                            cur += 1;
-                            task.iters.push(IterState::Range { cur, end });
-                            task.stack.push(v);
-                            Ok(true)
-                        } else {
-                            task.ip = target as usize;
-                            Ok(true)
+                Instr::PushFloat(f) => {
+                    task.stack.push(Value::Float(*f));
+                }
+                Instr::PushBool(b) => {
+                    task.stack.push(Value::Bool(*b));
+                }
+                Instr::PushStr(i) => {
+                    task.stack
+                        .push(Value::Str(prog.strings[*i as usize].clone()));
+                }
+                Instr::PushUnit => {
+                    task.stack.push(Value::Unit);
+                }
+                Instr::PushVar(i) => {
+                    let v = {
+                        let frame = task.frames.last().unwrap();
+                        match frame.cells.get(*i as usize).and_then(|c| c.clone()) {
+                            Some(cell) => cell.borrow().clone(),
+                            None => frame.locals[*i as usize].clone(),
+                        }
+                    };
+                    task.stack.push(v);
+                }
+                Instr::PushVarCell(i) => {
+                    let v = {
+                        let frame = task.frames.last().unwrap();
+                        match frame.cells.get(*i as usize).and_then(|c| c.clone()) {
+                            Some(cell) => {
+                                // If the variable already holds a reference, pass it through.
+                                let cur = cell.borrow().clone();
+                                match cur {
+                                    Value::Ref(inner) | Value::MutRef(inner) => Value::Ref(inner),
+                                    _ => Value::Ref(cell),
+                                }
+                            }
+                            None => {
+                                // First cell use: materialize the slot's cell.
+                                match frame.locals[*i as usize].clone() {
+                                    Value::Ref(inner) | Value::MutRef(inner) => Value::Ref(inner),
+                                    cur => {
+                                        let cell = Rc::new(RefCell::new(cur));
+                                        let frame = task.frames.last_mut().unwrap();
+                                        if frame.cells.len() <= *i as usize {
+                                            frame.cells.resize(*i as usize + 1, None);
+                                        }
+                                        frame.cells[*i as usize] = Some(cell.clone());
+                                        Value::Ref(cell)
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    task.stack.push(v);
+                }
+                Instr::PushGlobal(i) => {
+                    let name = &prog.globals[*i as usize];
+                    let v = self.global_value(name);
+                    task.stack.push(v);
+                }
+                Instr::StoreVar(i) => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    let cell = task
+                        .frames
+                        .last()
+                        .unwrap()
+                        .cells
+                        .get(*i as usize)
+                        .and_then(|c| c.clone());
+                    if let Some(cell) = cell {
+                        let cur = cell.borrow().clone();
+                        match cur {
+                            Value::MutRef(target) => {
+                                *target.borrow_mut() = v;
+                            }
+                            Value::Ref(_) => {
+                                return Err(err(Msg::ImmutableReassign("<ref>".into()), 0, 0));
+                            }
+                            _ => {
+                                *cell.borrow_mut() = v;
+                            }
+                        }
+                    } else {
+                        let slot = &mut task.frames.last_mut().unwrap().locals[*i as usize];
+                        match slot {
+                            Value::MutRef(target) => {
+                                *target.borrow_mut() = v;
+                            }
+                            Value::Ref(_) => {
+                                return Err(err(Msg::ImmutableReassign("<ref>".into()), 0, 0));
+                            }
+                            _ => {
+                                *slot = v;
+                            }
                         }
                     }
-                    IterState::List { items, mut idx } => {
-                        let len = items.borrow().len();
-                        if idx < len {
-                            let v = items.borrow()[idx].clone();
-                            idx += 1;
-                            task.iters.push(IterState::List { items, idx });
-                            task.stack.push(v);
-                            Ok(true)
-                        } else {
-                            task.ip = target as usize;
-                            Ok(true)
+                }
+                Instr::StoreGlobal(i) => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    let name = prog.globals[*i as usize].clone();
+                    self.set_global(&name, v)?;
+                }
+                Instr::BorrowVar(mutable, i) => {
+                    let cell = {
+                        let frame = task.frames.last().unwrap();
+                        match frame.cells.get(*i as usize).and_then(|c| c.clone()) {
+                            Some(cell) => cell,
+                            None => {
+                                let cell = Rc::new(RefCell::new(frame.locals[*i as usize].clone()));
+                                let frame = task.frames.last_mut().unwrap();
+                                if frame.cells.len() <= *i as usize {
+                                    frame.cells.resize(*i as usize + 1, None);
+                                }
+                                frame.cells[*i as usize] = Some(cell.clone());
+                                cell
+                            }
+                        }
+                    };
+                    if *mutable {
+                        task.stack.push(Value::MutRef(cell));
+                    } else {
+                        task.stack.push(Value::Ref(cell));
+                    }
+                }
+                Instr::MakeList(n) => {
+                    let mut items = Vec::with_capacity(*n as usize);
+                    for _ in 0..*n {
+                        items.push(task.stack.pop().unwrap_or(Value::Unit));
+                    }
+                    items.reverse();
+                    task.stack.push(Value::List(Rc::new(RefCell::new(items))));
+                }
+                Instr::ListLen => {
+                    let list = task.stack.pop().unwrap_or(Value::Unit);
+                    let len = match list {
+                        Value::List(items) => items.borrow().len(),
+                        _ => 0,
+                    };
+                    task.stack.push(Value::Int(len as i64));
+                }
+                Instr::ListGet => {
+                    let idx = task.stack.pop().unwrap_or(Value::Int(0));
+                    let list = task.stack.pop().unwrap_or(Value::Unit);
+                    let Value::Int(i) = idx else {
+                        return Err(err(Msg::IndexNotInt, 0, 0));
+                    };
+                    let item = match list {
+                        Value::List(items) => items
+                            .borrow()
+                            .get(i as usize)
+                            .cloned()
+                            .unwrap_or(Value::Unit),
+                        _ => return Err(err(Msg::IndexOnNonList(list.type_tag().into()), 0, 0)),
+                    };
+                    task.stack.push(item);
+                }
+                Instr::ListSet => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    let idx = task.stack.pop().unwrap_or(Value::Int(0));
+                    let list = task.stack.pop().unwrap_or(Value::Unit);
+                    let Value::Int(i) = idx else {
+                        return Err(err(Msg::IndexNotInt, 0, 0));
+                    };
+                    match list {
+                        Value::List(items) => {
+                            let mut items = items.borrow_mut();
+                            if (i as usize) < items.len() {
+                                items[i as usize] = v;
+                            }
+                        }
+                        other => {
+                            return Err(err(Msg::IndexOnNonList(other.type_tag().into()), 0, 0))
                         }
                     }
-                    IterState::Chan { chan } => {
-                        let mut c = chan.borrow_mut();
-                        if let Some(v) = c.buf.pop_front() {
-                            // A slot freed: admit a blocked sender.
-                            if let Some(pos) = self
+                    task.stack.push(Value::Unit);
+                }
+                Instr::IndexGet => {
+                    let idx = task.stack.pop().unwrap_or(Value::Int(0));
+                    let obj = task.stack.pop().unwrap_or(Value::Unit).deref();
+                    let Value::Int(i) = idx else {
+                        return Err(err(Msg::IndexNotInt, 0, 0));
+                    };
+                    let v = match obj {
+                        Value::List(items) => items
+                            .borrow()
+                            .get(i as usize)
+                            .cloned()
+                            .unwrap_or(Value::Unit),
+                        other => {
+                            return Err(err(Msg::IndexOnNonList(other.type_tag().into()), 0, 0))
+                        }
+                    };
+                    task.stack.push(v);
+                }
+                Instr::MakeStruct(si) => {
+                    let (name, fields) = prog.structs[*si as usize].clone();
+                    let mut values = Vec::with_capacity(fields.len());
+                    for _ in 0..fields.len() {
+                        values.push(task.stack.pop().unwrap_or(Value::Unit));
+                    }
+                    values.reverse();
+                    let fields: Vec<(String, Value)> = fields.into_iter().zip(values).collect();
+                    task.stack
+                        .push(Value::Struct(Box::new(StructVal { name, fields })));
+                }
+                Instr::GetField(f) => {
+                    let obj = task.stack.pop().unwrap_or(Value::Unit);
+                    let field = prog.strings[*f as usize].clone();
+                    let obj = obj.deref();
+                    let v = match obj {
+                        Value::Struct(sv) => sv
+                            .fields
+                            .iter()
+                            .find(|(n, _)| *n == field.as_ref())
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::Unit),
+                        other => {
+                            return Err(err(
+                                Msg::UnknownField {
+                                    ty: other.type_tag().into(),
+                                    field: field.to_string(),
+                                },
+                                0,
+                                0,
+                            ))
+                        }
+                    };
+                    task.stack.push(v);
+                }
+                Instr::SetField(f) => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    let obj = task.stack.pop().unwrap_or(Value::Unit);
+                    let field = prog.strings[*f as usize].clone();
+                    // If the receiver is a shared cell, mutate through it.
+                    match obj {
+                        Value::Ref(cell) | Value::MutRef(cell) => {
+                            let mut cur = cell.borrow_mut();
+                            let tag = cur.type_tag();
+                            let Value::Struct(sv) = &mut *cur else {
+                                return Err(err(
+                                    Msg::UnknownField {
+                                        ty: tag.into(),
+                                        field: field.to_string(),
+                                    },
+                                    0,
+                                    0,
+                                ));
+                            };
+                            if let Some(slot) =
+                                sv.fields.iter_mut().find(|(n, _)| *n == field.as_ref())
+                            {
+                                slot.1 = v;
+                            }
+                            task.stack.push(Value::Unit);
+                        }
+                        obj => {
+                            let tag = obj.type_tag();
+                            let obj = obj.deref();
+                            let Value::Struct(mut sv) = obj else {
+                                return Err(err(
+                                    Msg::UnknownField {
+                                        ty: tag.into(),
+                                        field: field.to_string(),
+                                    },
+                                    0,
+                                    0,
+                                ));
+                            };
+                            if let Some(slot) =
+                                sv.fields.iter_mut().find(|(n, _)| *n == field.as_ref())
+                            {
+                                slot.1 = v;
+                            }
+                            task.stack.push(Value::Struct(sv));
+                        }
+                    }
+                }
+                Instr::Call(fi) => {
+                    let f = &prog.functions[*fi as usize];
+                    let mut args = Vec::with_capacity(f.nparams as usize);
+                    for _ in 0..f.nparams {
+                        args.push(task.stack.pop().unwrap_or(Value::Unit));
+                    }
+                    args.reverse();
+                    let mut locals = args;
+                    locals.resize(f.nlocals as usize, Value::Unit);
+                    let ret = task.ip;
+                    task.frames.push(Frame {
+                        func: *fi as usize,
+                        ret,
+                        locals,
+                        cells: Vec::new(),
+                    });
+                    task.ip = 0;
+                }
+                Instr::CallMethod(m) => {
+                    let method = prog.strings[*m as usize].clone();
+                    // Find the method implementation by runtime struct type.
+                    // Stack layout: [receiver, arg1, ..., argN].
+                    let recv = task.stack.first().cloned().unwrap_or(Value::Unit);
+                    let ty = match recv.deref() {
+                        Value::Struct(sv) => sv.name.clone(),
+                        Value::List(_) => {
+                            let argc = match method.as_ref() {
+                                "len" => 1,
+                                "push" | "get" => 2,
+                                "set" => 3,
+                                _ => {
+                                    return Err(err(
+                                        Msg::UnknownMethod {
+                                            ty: "List".into(),
+                                            method: method.to_string(),
+                                        },
+                                        0,
+                                        0,
+                                    ))
+                                }
+                            };
+                            let args = collect_args(&mut task.stack, argc)?;
+                            let recv = args[0].deref();
+                            return self.list_method(&mut task.stack, recv, &method, &args[1..]);
+                        }
+                        Value::Chan(_) => {
+                            let argc = match method.as_ref() {
+                                "send" => 2,
+                                "recv" | "close" => 1,
+                                _ => {
+                                    return Err(err(
+                                        Msg::UnknownMethod {
+                                            ty: "Chan".into(),
+                                            method: method.to_string(),
+                                        },
+                                        0,
+                                        0,
+                                    ))
+                                }
+                            };
+                            let args = collect_args(&mut task.stack, argc)?;
+                            let recv = args[0].deref();
+                            let blocked =
+                                self.chan_method(&mut task.stack, recv, &method, &args[1..], id)?;
+                            if !blocked && method.as_ref() == "recv" {
+                                // Blocked recv: retry CallMethod after being woken
+                                // by re-executing it (args restored on the stack).
+                                task.ip = task.ip.saturating_sub(1);
+                                for a in args.iter().rev() {
+                                    task.stack.push(a.clone());
+                                }
+                            }
+                            return Ok(true);
+                        }
+                        other => {
+                            return Err(err(
+                                Msg::UnknownMethod {
+                                    ty: other.type_tag().into(),
+                                    method: method.to_string(),
+                                },
+                                0,
+                                0,
+                            ))
+                        }
+                    };
+                    let Some(&fi) = prog
+                        .methods
+                        .iter()
+                        .find(|((t, n), _)| t == &ty && n.as_str() == method.as_ref())
+                        .map(|(_, i)| i)
+                    else {
+                        return Err(err(
+                            Msg::UnknownMethod {
+                                ty: ty.clone(),
+                                method: method.to_string(),
+                            },
+                            0,
+                            0,
+                        ));
+                    };
+                    let f = &prog.functions[fi];
+                    let argc = f.nparams as usize;
+                    let mut args = Vec::with_capacity(argc);
+                    for _ in 0..argc {
+                        args.push(task.stack.pop().unwrap_or(Value::Unit));
+                    }
+                    args.reverse();
+                    let mut locals = args;
+                    locals.resize(f.nlocals as usize, Value::Unit);
+                    let ret = task.ip;
+                    task.frames.push(Frame {
+                        func: fi,
+                        ret,
+                        locals,
+                        cells: Vec::new(),
+                    });
+                    task.ip = 0;
+                }
+                Instr::BuiltinPrint(n) => {
+                    let mut parts = Vec::with_capacity(*n as usize);
+                    for _ in 0..*n {
+                        parts.push(task.stack.pop().unwrap_or(Value::Unit));
+                    }
+                    parts.reverse();
+                    let line = parts
+                        .iter()
+                        .map(|v| v.display())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    writeln!(self.out, "{}", line)
+                        .map_err(|e| err(Msg::Io(e.to_string()), 0, 0))?;
+                    task.stack.push(Value::Unit);
+                }
+                Instr::BuiltinRange => {
+                    let end = task.stack.pop().unwrap_or(Value::Int(0));
+                    let start = task.stack.pop().unwrap_or(Value::Int(0));
+                    let (Value::Int(s), Value::Int(e)) = (start, end) else {
+                        return Err(err(Msg::RangeNotInt, 0, 0));
+                    };
+                    task.stack.push(Value::Range { start: s, end: e });
+                }
+                Instr::Return => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    let done = task.frames.len() == 1;
+                    let ret = task.frames.pop().map(|f| f.ret).unwrap_or(0);
+                    if !done {
+                        task.ip = ret;
+                    } else {
+                        task.done = true;
+                    }
+                    task.stack.push(v);
+                }
+                Instr::Jump(target) => {
+                    task.ip = *target as usize;
+                }
+                Instr::JumpIfFalse(target) => {
+                    let v = task.stack.pop().unwrap_or(Value::Bool(false));
+                    if !truthy(&v) {
+                        task.ip = *target as usize;
+                    }
+                }
+                Instr::ForInit => {
+                    let it = task.stack.pop().unwrap_or(Value::Unit);
+                    let iter = match it {
+                        Value::Range { start, end } => IterState::Range { cur: start, end },
+                        Value::List(items) => IterState::List { items, idx: 0 },
+                        Value::Chan(chan) => IterState::Chan { chan },
+                        other => {
+                            return Err(err(Msg::ForNotSupported(other.type_tag().into()), 0, 0))
+                        }
+                    };
+                    task.iters.push(iter);
+                }
+                Instr::ForNext(target) => {
+                    // Take the top iterator out so we can also touch the stack.
+                    let Some(iter) = task.iters.pop() else {
+                        task.ip = *target as usize;
+                        return Ok(true);
+                    };
+                    match iter {
+                        IterState::Range { mut cur, end } => {
+                            if cur < end {
+                                let v = Value::Int(cur);
+                                cur += 1;
+                                task.iters.push(IterState::Range { cur, end });
+                                task.stack.push(v);
+                            } else {
+                                task.ip = *target as usize;
+                            }
+                        }
+                        IterState::List { items, mut idx } => {
+                            let len = items.borrow().len();
+                            if idx < len {
+                                let v = items.borrow()[idx].clone();
+                                idx += 1;
+                                task.iters.push(IterState::List { items, idx });
+                                task.stack.push(v);
+                            } else {
+                                task.ip = *target as usize;
+                            }
+                        }
+                        IterState::Chan { chan } => {
+                            let mut c = chan.borrow_mut();
+                            if let Some(v) = c.buf.pop_front() {
+                                // A slot freed: admit a blocked sender.
+                                if let Some(pos) = self
+                                    .pending_sends
+                                    .iter()
+                                    .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
+                                {
+                                    if let Some((_, v2, sender)) = self.pending_sends.remove(pos) {
+                                        c.buf.push_back(v2);
+                                        self.task_states[sender] = TaskState::Ready;
+                                    }
+                                }
+                                drop(c);
+                                task.iters.push(IterState::Chan { chan });
+                                task.stack.push(v);
+                            } else if let Some(pos) = self
                                 .pending_sends
                                 .iter()
                                 .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
                             {
-                                if let Some((_, v2, sender)) = self.pending_sends.remove(pos) {
-                                    c.buf.push_back(v2);
+                                if let Some((_, v, sender)) = self.pending_sends.remove(pos) {
                                     self.task_states[sender] = TaskState::Ready;
+                                    drop(c);
+                                    task.iters.push(IterState::Chan { chan });
+                                    task.stack.push(v);
+                                } else {
+                                    unreachable!()
                                 }
+                            } else if c.closed {
+                                task.ip = *target as usize;
+                            } else {
+                                // Block until a value or close arrives; retry
+                                // the ForNext after being woken.
+                                c.waiting.push_back(id);
+                                drop(c);
+                                task.iters.push(IterState::Chan { chan });
+                                task.ip = task.ip.saturating_sub(1);
+                                self.task_states[id] = TaskState::Blocked(0, 0);
+                                return Ok(true);
                             }
-                            drop(c);
-                            task.iters.push(IterState::Chan { chan });
-                            task.stack.push(v);
-                            Ok(true)
-                        } else if let Some(pos) = self
+                        }
+                    }
+                }
+                Instr::ChanSend => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    let ch = task.stack.pop().unwrap_or(Value::Unit);
+                    let Value::Chan(chan) = ch else {
+                        return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
+                    };
+                    let mut c = chan.borrow_mut();
+                    if c.closed {
+                        return Err(err(Msg::BadCall("send on closed channel".into()), 0, 0));
+                    }
+                    if c.buf.len() < c.cap || c.cap == 0 {
+                        if c.cap == 0 {
+                            if let Some(w) = c.waiting.pop_front() {
+                                c.buf.push_back(v);
+                                self.task_states[w] = TaskState::Ready;
+                                task.stack.push(Value::Unit);
+                                return Ok(true);
+                            }
+                        } else {
+                            c.buf.push_back(v);
+                            if let Some(w) = c.waiting.pop_front() {
+                                self.task_states[w] = TaskState::Ready;
+                            }
+                            task.stack.push(Value::Unit);
+                            return Ok(true);
+                        }
+                    }
+                    // Block: store the pending value on a side queue. When a
+                    // receiver matches, the send is complete; no retry needed.
+                    self.pending_sends.push_back((chan.clone(), v, id));
+                    self.task_states[id] = TaskState::Blocked(0, 1);
+                    return Ok(true);
+                }
+                Instr::ChanRecv => {
+                    let ch = task.stack.pop().unwrap_or(Value::Unit);
+                    let Value::Chan(chan) = ch else {
+                        return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
+                    };
+                    let mut c = chan.borrow_mut();
+                    if let Some(v) = c.buf.pop_front() {
+                        // A slot freed up: admit a waiting sender if any.
+                        if let Some(pos) = self
                             .pending_sends
                             .iter()
                             .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
                         {
-                            if let Some((_, v, sender)) = self.pending_sends.remove(pos) {
+                            if let Some((_, v2, sender)) = self.pending_sends.remove(pos) {
+                                c.buf.push_back(v2);
                                 self.task_states[sender] = TaskState::Ready;
-                                drop(c);
-                                task.iters.push(IterState::Chan { chan });
-                                task.stack.push(v);
-                                Ok(true)
-                            } else {
-                                unreachable!()
                             }
-                        } else if c.closed {
-                            task.ip = target as usize;
-                            Ok(true)
-                        } else {
-                            // Block until a value or close arrives; retry
-                            // the ForNext after being woken.
-                            c.waiting.push_back(id);
-                            drop(c);
-                            task.iters.push(IterState::Chan { chan });
-                            task.ip = task.ip.saturating_sub(1);
-                            self.task_states[id] = TaskState::Blocked(0, 0);
-                            Ok(false)
                         }
-                    }
-                }
-            }
-            Instr::ChanSend => {
-                let v = task.stack.pop().unwrap_or(Value::Unit);
-                let ch = task.stack.pop().unwrap_or(Value::Unit);
-                let Value::Chan(chan) = ch else {
-                    return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
-                };
-                let mut c = chan.borrow_mut();
-                if c.closed {
-                    return Err(err(Msg::BadCall("send on closed channel".into()), 0, 0));
-                }
-                if c.buf.len() < c.cap || c.cap == 0 {
-                    if c.cap == 0 {
-                        if let Some(w) = c.waiting.pop_front() {
-                            c.buf.push_back(v);
-                            self.task_states[w] = TaskState::Ready;
-                            task.stack.push(Value::Unit);
-                            return Ok(true);
-                        }
-                    } else {
-                        c.buf.push_back(v);
-                        if let Some(w) = c.waiting.pop_front() {
-                            self.task_states[w] = TaskState::Ready;
-                        }
-                        task.stack.push(Value::Unit);
-                        return Ok(true);
-                    }
-                }
-                // Block: store the pending value on a side queue. When a
-                // receiver matches, the send is complete; no retry needed.
-                self.pending_sends.push_back((chan.clone(), v, id));
-                self.task_states[id] = TaskState::Blocked(0, 1);
-                Ok(false)
-            }
-            Instr::ChanRecv => {
-                let ch = task.stack.pop().unwrap_or(Value::Unit);
-                let Value::Chan(chan) = ch else {
-                    return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
-                };
-                let mut c = chan.borrow_mut();
-                if let Some(v) = c.buf.pop_front() {
-                    // A slot freed up: admit a waiting sender if any.
-                    if let Some(pos) = self
+                        task.stack.push(v);
+                    } else if let Some(pos) = self
                         .pending_sends
                         .iter()
                         .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
                     {
-                        if let Some((_, v2, sender)) = self.pending_sends.remove(pos) {
-                            c.buf.push_back(v2);
+                        // Hand the value over directly (unbuffered rendezvous).
+                        if let Some((_, v, sender)) = self.pending_sends.remove(pos) {
                             self.task_states[sender] = TaskState::Ready;
+                            task.stack.push(v);
+                        } else {
+                            unreachable!()
                         }
-                    }
-                    task.stack.push(v);
-                    Ok(true)
-                } else if let Some(pos) = self
-                    .pending_sends
-                    .iter()
-                    .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
-                {
-                    // Hand the value over directly (unbuffered rendezvous).
-                    if let Some((_, v, sender)) = self.pending_sends.remove(pos) {
-                        self.task_states[sender] = TaskState::Ready;
-                        task.stack.push(v);
-                        Ok(true)
+                    } else if c.closed {
+                        task.stack.push(Value::Unit);
                     } else {
-                        unreachable!()
+                        // Block: the matching sender pushes the value directly
+                        // onto this task's stack when it wakes us.
+                        c.waiting.push_back(id);
+                        self.task_states[id] = TaskState::Blocked(0, 0);
+                        return Ok(true);
                     }
-                } else if c.closed {
+                }
+                Instr::ChanClose => {
+                    let ch = task.stack.pop().unwrap_or(Value::Unit);
+                    let Value::Chan(chan) = ch else {
+                        return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
+                    };
+                    let mut c = chan.borrow_mut();
+                    c.closed = true;
+                    // Wake all waiters; they observe the closed state.
+                    let waiters: Vec<usize> = c.waiting.drain(..).collect();
+                    for w in waiters {
+                        self.task_states[w] = TaskState::Ready;
+                    }
                     task.stack.push(Value::Unit);
-                    Ok(true)
-                } else {
-                    // Block: the matching sender pushes the value directly
-                    // onto this task's stack when it wakes us.
-                    c.waiting.push_back(id);
-                    self.task_states[id] = TaskState::Blocked(0, 0);
-                    Ok(false)
                 }
-            }
-            Instr::ChanClose => {
-                let ch = task.stack.pop().unwrap_or(Value::Unit);
-                let Value::Chan(chan) = ch else {
-                    return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
-                };
-                let mut c = chan.borrow_mut();
-                c.closed = true;
-                // Wake all waiters; they observe the closed state.
-                let waiters: Vec<usize> = c.waiting.drain(..).collect();
-                for w in waiters {
-                    self.task_states[w] = TaskState::Ready;
+                Instr::MakeChan(_) => {
+                    let buf = task.stack.pop().unwrap_or(Value::Int(0));
+                    let Value::Int(cap) = buf else {
+                        return Err(err(Msg::RangeNotInt, 0, 0));
+                    };
+                    let chan = Rc::new(RefCell::new(Channel::new(cap.max(0) as usize)));
+                    self.channels.push(chan.clone());
+                    task.stack.push(Value::Chan(chan));
                 }
-                task.stack.push(Value::Unit);
-                Ok(true)
-            }
-            Instr::MakeChan(_) => {
-                let buf = task.stack.pop().unwrap_or(Value::Int(0));
-                let Value::Int(cap) = buf else {
-                    return Err(err(Msg::RangeNotInt, 0, 0));
-                };
-                let chan = Rc::new(RefCell::new(Channel::new(cap.max(0) as usize)));
-                self.channels.push(chan.clone());
-                task.stack.push(Value::Chan(chan));
-                Ok(true)
-            }
-            Instr::Go(fi, argc) => {
-                let mut args = Vec::with_capacity(argc as usize);
-                for _ in 0..argc {
-                    args.push(task.stack.pop().unwrap_or(Value::Unit));
+                Instr::Go(fi, argc) => {
+                    let mut args = Vec::with_capacity(*argc as usize);
+                    for _ in 0..*argc {
+                        args.push(task.stack.pop().unwrap_or(Value::Unit));
+                    }
+                    args.reverse();
+                    let group = task.group;
+                    let child = self.spawn(*fi as usize, args, group);
+                    let _ = child;
+                    task.stack.push(Value::Unit);
                 }
-                args.reverse();
-                let group = task.group;
-                let child = self.spawn(fi as usize, args, group);
-                let _ = child;
-                task.stack.push(Value::Unit);
-                Ok(true)
-            }
-            Instr::TaskGroupBegin => {
-                let gid = self.groups.len();
-                self.groups.push(Vec::new());
-                task.groups.push((gid, task.group));
-                task.group = gid;
-                Ok(true)
-            }
-            Instr::TaskGroupEnd => {
-                let (gid, parent) = task.groups.pop().unwrap_or((0, 0));
-                // Wait for all children of this group to finish.
-                let done = self.groups[gid].is_empty();
-                if done {
-                    task.group = parent;
-                    Ok(true)
-                } else {
-                    // Re-execute TaskGroupEnd after being woken.
-                    task.ip = task.ip.saturating_sub(1);
-                    task.groups.push((gid, parent));
-                    self.task_states[id] = TaskState::Blocked(0, 2);
-                    self.group_waiters.push((gid, id));
-                    Ok(false)
+                Instr::TaskGroupBegin => {
+                    let gid = self.groups.len();
+                    self.groups.push(Vec::new());
+                    task.groups.push((gid, task.group));
+                    task.group = gid;
                 }
-            }
-            Instr::Yield => {
-                // Cooperative: switch to the next ready task by returning.
-                Ok(true)
-            }
-            Instr::Pop => {
-                task.stack.pop();
-                Ok(true)
-            }
-            Instr::Dup => {
-                if let Some(v) = task.stack.last() {
-                    task.stack.push(v.clone());
+                Instr::TaskGroupEnd => {
+                    let (gid, parent) = task.groups.pop().unwrap_or((0, 0));
+                    // Wait for all children of this group to finish.
+                    let done = self.groups[gid].is_empty();
+                    if done {
+                        task.group = parent;
+                    } else {
+                        // Re-execute TaskGroupEnd after being woken.
+                        task.ip = task.ip.saturating_sub(1);
+                        task.groups.push((gid, parent));
+                        self.task_states[id] = TaskState::Blocked(0, 2);
+                        self.group_waiters.push((gid, id));
+                        return Ok(true);
+                    }
                 }
-                Ok(true)
-            }
-            Instr::Not => {
-                let v = task.stack.pop().unwrap_or(Value::Bool(false));
-                task.stack.push(Value::Bool(!truthy(&v)));
-                Ok(true)
-            }
-            Instr::Binary(op) => {
-                let r = task.stack.pop().unwrap_or(Value::Unit);
-                let l = task.stack.pop().unwrap_or(Value::Unit);
-                let v = binary(op, l, r).map_err(|m| err(m, 0, 0))?;
-                task.stack.push(v);
-                Ok(true)
-            }
-            Instr::RetUnit => {
-                let done = task.frames.len() == 1;
-                let ret = task.frames.pop().map(|f| f.ret).unwrap_or(0);
-                if !done {
-                    task.ip = ret;
-                } else {
-                    task.done = true;
+                Instr::Yield => {
+                    // Cooperative: switch to the next ready task.
+                    return Ok(true);
                 }
-                task.stack.push(Value::Unit);
-                Ok(true)
+                Instr::Pop => {
+                    task.stack.pop();
+                }
+                Instr::Dup => {
+                    if let Some(v) = task.stack.last() {
+                        task.stack.push(v.clone());
+                    }
+                }
+                Instr::Not => {
+                    let v = task.stack.pop().unwrap_or(Value::Bool(false));
+                    task.stack.push(Value::Bool(!truthy(&v)));
+                }
+                Instr::Binary(op) => {
+                    let r = task.stack.pop().unwrap_or(Value::Unit);
+                    let l = task.stack.pop().unwrap_or(Value::Unit);
+                    // Fast path: int arithmetic without the generic dispatch.
+                    let v = match (*op, &l, &r) {
+                        (BinOp::Add, Value::Int(a), Value::Int(b)) => {
+                            Value::Int(a.wrapping_add(*b))
+                        }
+                        (BinOp::Sub, Value::Int(a), Value::Int(b)) => {
+                            Value::Int(a.wrapping_sub(*b))
+                        }
+                        (BinOp::Mul, Value::Int(a), Value::Int(b)) => {
+                            Value::Int(a.wrapping_mul(*b))
+                        }
+                        (BinOp::Div, Value::Int(a), Value::Int(b)) => {
+                            if *b == 0 {
+                                return Err(err(Msg::DivByZero, 0, 0));
+                            }
+                            Value::Int(a / b)
+                        }
+                        (BinOp::Mod, Value::Int(a), Value::Int(b)) => {
+                            if *b == 0 {
+                                return Err(err(Msg::ModByZero, 0, 0));
+                            }
+                            Value::Int(a % b)
+                        }
+                        _ => binary(*op, &l, &r).map_err(|m| err(m, 0, 0))?,
+                    };
+                    task.stack.push(v);
+                }
+                Instr::RetUnit => {
+                    let done = task.frames.len() == 1;
+                    let ret = task.frames.pop().map(|f| f.ret).unwrap_or(0);
+                    if !done {
+                        task.ip = ret;
+                    } else {
+                        task.done = true;
+                    }
+                    task.stack.push(Value::Unit);
+                }
             }
         }
+        Ok(true)
     }
 
     fn list_method(
@@ -1286,15 +1332,15 @@ fn truthy(v: &Value) -> bool {
         Value::Float(f) => *f != 0.0,
         Value::Str(s) => !s.is_empty(),
         Value::List(items) => !items.borrow().is_empty(),
-        Value::Struct { .. } => true,
+        Value::Struct(_) => true,
         _ => false,
     }
 }
 
-fn binary(op: BinOp, l: Value, r: Value) -> Result<Value, Msg> {
+fn binary(op: BinOp, l: &Value, r: &Value) -> Result<Value, Msg> {
     use BinOp::*;
     match op {
-        Add | Sub | Mul | Div | Mod => match (&l, &r) {
+        Add | Sub | Mul | Div | Mod => match (l, r) {
             (Value::Int(a), Value::Int(b)) => match op {
                 Add => Ok(Value::Int(a.wrapping_add(*b))),
                 Sub => Ok(Value::Int(a.wrapping_sub(*b))),
@@ -1316,10 +1362,15 @@ fn binary(op: BinOp, l: Value, r: Value) -> Result<Value, Msg> {
             (Value::Int(a), Value::Float(b)) => float_op(op, *a as f64, *b),
             (Value::Float(a), Value::Int(b)) => float_op(op, *a, *b as f64),
             (Value::Float(a), Value::Float(b)) => float_op(op, *a, *b),
-            (Value::Str(a), Value::Str(b)) if op == Add => Ok(Value::Str(format!("{}{}", a, b))),
+            (Value::Str(a), Value::Str(b)) if op == Add => {
+                let mut s = String::with_capacity(a.len() + b.len());
+                s.push_str(a);
+                s.push_str(b);
+                Ok(Value::Str(s.into()))
+            }
             _ => Err(Msg::TypeMismatch),
         },
-        Eq | Ne | Lt | Le | Gt | Ge => cmp_op(op, &l, &r),
+        Eq | Ne | Lt | Le | Gt | Ge => cmp_op(op, l, r),
         And | Or => unreachable!("and/or handled by compiler as binary"),
     }
 }

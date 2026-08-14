@@ -8,6 +8,7 @@ use sole_parser::{BinOp, Block, ElseBranch, Expr, FnDef, ImplDef, Item, Program,
 use std::collections::HashMap;
 
 use crate::vm::{CompiledProgram, Function, Instr, Value};
+use std::rc::Rc;
 
 struct FuncCtx {
     locals: HashMap<String, u32>,
@@ -74,7 +75,7 @@ pub fn compile(program: &Program) -> Result<CompiledProgram, String> {
     Ok(CompiledProgram {
         functions: c.functions,
         globals: Vec::new(),
-        strings: c.strings,
+        strings: c.strings.into_iter().map(Rc::from).collect(),
         methods: c.methods,
         structs: c.structs,
         chan_elem: c.chan_elem,
@@ -519,7 +520,7 @@ impl Value {
             Value::Int(n) => n.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Bool(b) => b.to_string(),
-            Value::Str(s) => s.clone(),
+            Value::Str(s) => s.to_string(),
             Value::Range { start, end } => format!("range({}, {})", start, end),
             Value::List(items) => format!(
                 "[{}]",
@@ -530,10 +531,10 @@ impl Value {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Value::Struct { name, fields } => format!(
+            Value::Struct(sv) => format!(
                 "{} {{ {} }}",
-                name,
-                fields
+                sv.name,
+                sv.fields
                     .iter()
                     .map(|(n, v)| format!("{}: {}", n, v.display()))
                     .collect::<Vec<_>>()

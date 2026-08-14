@@ -7,6 +7,7 @@
 
 **M1(词法 + 解析 + 树遍历解释器 + 简单类型检查)已完成。**
 **M2(完整静态类型检查 + 移动语义 + 借用检查 + List/struct/interface)已完成。**
+**M3(字节码 VM + 协程调度器 + 通道运行时)已完成。**
 
 当前支持:
 
@@ -17,6 +18,10 @@
   可变借用冲突、借用逃逸;错误码 E04xx)
 - 集合类型 `List[T]`(字面量 `[1, 2]`、索引、`len`/`push`/`get`/`set`)
 - 结构体 `struct` / 接口 `interface` / 实现 `impl` 与方法调用(含 `self` 借用)
+- 字节码 VM:AST → 字节码(compiler + stack VM),locals 值语义 + 惰性借用 cell,
+  `&Instr` 引用分派,run-until-block 协作调度(性能与 CPython 同量级,见 `bench/`)
+- 并发原语:协程(`go`)、`task_group`(结构化并发:作用域等待 + 取消传播)、
+  通道 `Chan[T]`(`send`/`recv`/`close`、缓冲/无缓冲、`for v in ch` 接收循环、`yield`)
 - 内置函数 `print`、`range`
 - 可变性检查(`let mut` 才能重新赋值)、错误定位(词法/解析/类型检查/求值错误均带行列)
 - 双语错误信息(`--lang en|zh` 或 `SOLE_LANG` 环境变量)
@@ -30,6 +35,7 @@ cargo run --bin sole -- run examples/list.sole       # List + 借用(M2)
 cargo run --bin sole -- run examples/borrow.sole     # ref / mut ref(M2)
 cargo run --bin sole -- run examples/shapes.sole     # struct / interface(M2)
 cargo run --bin sole -- run --lang zh examples/hello.sole   # 错误信息中文
+cargo run --bin sole -- run bench/fib_sum.sole       # 性能基准(M3,对比 CPython)
 cargo test --workspace
 ```
 
@@ -51,5 +57,5 @@ cargo test --workspace
 - 整数除法暂为截断;truthiness 暂为 Python 风格(暂定)
 - 借用检查为 M2 最小规则集(变量级 + 字段级借用、借用传播);M3 补全细粒度与索引借用
 - 未实现: 完整泛型(自定义泛型类型与约束)、`Dict`/`Set`/`Tuple` 等其余集合、
-  并发原语(`task_group` / `go` / `Chan`,关键字已保留)
+  `select` 多路复用、`Shared[T]` / `Mutex`(GOALS §7.5)
 - `ref` / `mut ref` 有完整借用检查,但无运行时借用逃逸检测(由静态检查保证)
