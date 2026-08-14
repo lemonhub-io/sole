@@ -4,9 +4,7 @@
 //! indices; globals to program-global indices. Calls with `ref`/`mut ref`
 //! parameters push the caller's cell (`PushVarCell`) so writes propagate.
 
-use sole_parser::{
-    BinOp, Block, ElseBranch, Expr, FnDef, ImplDef, Item, Program, Stmt, UnOp,
-};
+use sole_parser::{BinOp, Block, ElseBranch, Expr, FnDef, ImplDef, Item, Program, Stmt, UnOp};
 use std::collections::HashMap;
 
 use crate::vm::{CompiledProgram, Function, Instr, Value};
@@ -120,12 +118,15 @@ impl<'a> Compiler<'a> {
         // Entry function: top-level statements, implicitly inside a
         // task_group (GOALS §7.3). Reserve slot 0 first so that `fn_index`
         // during body compilation sees the final layout.
-        self.functions.insert(0, Function {
-            name: "<entry>".into(),
-            nparams: 0,
-            nlocals: 0,
-            code: Vec::new(),
-        });
+        self.functions.insert(
+            0,
+            Function {
+                name: "<entry>".into(),
+                nparams: 0,
+                nlocals: 0,
+                code: Vec::new(),
+            },
+        );
         let mut code = Vec::new();
         let mut ctx = FuncCtx {
             locals: HashMap::new(),
@@ -193,14 +194,24 @@ impl<'a> Compiler<'a> {
         i
     }
 
-    fn compile_block(&mut self, block: &Block, code: &mut Vec<Instr>, ctx: &mut FuncCtx) -> Result<(), String> {
+    fn compile_block(
+        &mut self,
+        block: &Block,
+        code: &mut Vec<Instr>,
+        ctx: &mut FuncCtx,
+    ) -> Result<(), String> {
         for stmt in &block.stmts {
             self.compile_stmt(stmt, code, ctx)?;
         }
         Ok(())
     }
 
-    fn compile_stmt(&mut self, stmt: &Stmt, code: &mut Vec<Instr>, ctx: &mut FuncCtx) -> Result<(), String> {
+    fn compile_stmt(
+        &mut self,
+        stmt: &Stmt,
+        code: &mut Vec<Instr>,
+        ctx: &mut FuncCtx,
+    ) -> Result<(), String> {
         match stmt {
             Stmt::Let { name, value, .. } => {
                 self.compile_expr(value, code, ctx)?;
@@ -212,7 +223,9 @@ impl<'a> Compiler<'a> {
                 let slot = ctx.slot(name);
                 code.push(Instr::StoreVar(slot));
             }
-            Stmt::FieldAssign { obj, field, value, .. } => {
+            Stmt::FieldAssign {
+                obj, field, value, ..
+            } => {
                 let obj_slot = ctx.slot(obj);
                 code.push(Instr::PushVarCell(obj_slot));
                 self.compile_expr(value, code, ctx)?;
@@ -330,7 +343,12 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn compile_expr(&mut self, expr: &Expr, code: &mut Vec<Instr>, ctx: &mut FuncCtx) -> Result<(), String> {
+    fn compile_expr(
+        &mut self,
+        expr: &Expr,
+        code: &mut Vec<Instr>,
+        ctx: &mut FuncCtx,
+    ) -> Result<(), String> {
         match expr {
             Expr::Int(n, _) => code.push(Instr::PushInt(*n)),
             Expr::Float(f, _) => code.push(Instr::PushFloat(*f)),
@@ -407,11 +425,7 @@ impl<'a> Compiler<'a> {
                         for a in args {
                             self.compile_expr(a, code, ctx)?;
                         }
-                        let si = self
-                            .structs
-                            .iter()
-                            .position(|(n, _)| n == name)
-                            .unwrap() as u32;
+                        let si = self.structs.iter().position(|(n, _)| n == name).unwrap() as u32;
                         code.push(Instr::MakeStruct(si));
                         return Ok(());
                     }
@@ -436,7 +450,12 @@ impl<'a> Compiler<'a> {
                         }
                         _ => self.fn_index(name),
                     },
-                    _ => return Err(format!("unsupported callee at {}:{}", span.line, span.column)),
+                    _ => {
+                        return Err(format!(
+                            "unsupported callee at {}:{}",
+                            span.line, span.column
+                        ))
+                    }
                 };
                 for a in args {
                     self.compile_expr(a, code, ctx)?;

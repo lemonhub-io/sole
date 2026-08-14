@@ -18,9 +18,15 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     Str(String),
-    Range { start: i64, end: i64 },
+    Range {
+        start: i64,
+        end: i64,
+    },
     List(Rc<RefCell<Vec<Value>>>),
-    Struct { name: String, fields: Vec<(String, Value)> },
+    Struct {
+        name: String,
+        fields: Vec<(String, Value)>,
+    },
     Chan(Rc<RefCell<Channel>>),
     Ref(Rc<RefCell<Value>>),
     MutRef(Rc<RefCell<Value>>),
@@ -189,6 +195,7 @@ pub struct Frame {
     pub ret: usize,
     pub locals: Vec<Rc<RefCell<Value>>>,
 }
+#[derive(Default)]
 pub struct Task {
     pub ip: usize,
     pub stack: Vec<Value>,
@@ -199,20 +206,6 @@ pub struct Task {
     pub iters: Vec<IterState>,
     /// Per-task task_group stack: (group id, parent group).
     pub groups: Vec<(usize, usize)>,
-}
-
-impl Default for Task {
-    fn default() -> Self {
-        Self {
-            ip: 0,
-            stack: Vec::new(),
-            frames: Vec::new(),
-            group: 0,
-            done: false,
-            iters: Vec::new(),
-            groups: Vec::new(),
-        }
-    }
 }
 
 /// Scheduling states a task can be in.
@@ -245,9 +238,17 @@ pub struct Runtime<'a> {
 
 /// Iteration state for `for` loops (Range / List / Chan).
 pub enum IterState {
-    Range { cur: i64, end: i64 },
-    List { items: Rc<RefCell<Vec<Value>>>, idx: usize },
-    Chan { chan: Rc<RefCell<Channel>> },
+    Range {
+        cur: i64,
+        end: i64,
+    },
+    List {
+        items: Rc<RefCell<Vec<Value>>>,
+        idx: usize,
+    },
+    Chan {
+        chan: Rc<RefCell<Channel>>,
+    },
 }
 
 impl<'a> Runtime<'a> {
@@ -273,10 +274,8 @@ impl<'a> Runtime<'a> {
                 }
             }
         } else {
-            self.globals.insert(
-                name.to_string(),
-                Rc::new(RefCell::new(value)),
-            );
+            self.globals
+                .insert(name.to_string(), Rc::new(RefCell::new(value)));
         }
         Ok(())
     }
@@ -302,9 +301,9 @@ impl<'a> Runtime<'a> {
     pub fn run(&mut self) -> Result<(), VmError> {
         // Initialize globals.
         for name in &self.prog.globals {
-            self.globals.entry(name.clone()).or_insert_with(|| {
-                Rc::new(RefCell::new(Value::Unit))
-            });
+            self.globals
+                .entry(name.clone())
+                .or_insert_with(|| Rc::new(RefCell::new(Value::Unit)));
         }
         self.spawn(0, vec![], 0);
         self.schedule_all()
@@ -449,7 +448,9 @@ impl<'a> Runtime<'a> {
                 Ok(true)
             }
             Instr::PushVar(i) => {
-                let v = task.frames.last().unwrap().locals[i as usize].borrow().clone();
+                let v = task.frames.last().unwrap().locals[i as usize]
+                    .borrow()
+                    .clone();
                 task.stack.push(v);
                 Ok(true)
             }
@@ -479,11 +480,7 @@ impl<'a> Runtime<'a> {
                         *target.borrow_mut() = v;
                     }
                     Value::Ref(_) => {
-                        return Err(err(
-                            Msg::ImmutableReassign("<ref>".into()),
-                            0,
-                            0,
-                        ));
+                        return Err(err(Msg::ImmutableReassign("<ref>".into()), 0, 0));
                     }
                     _ => {
                         *cell.borrow_mut() = v;
@@ -681,7 +678,7 @@ impl<'a> Runtime<'a> {
                     locals: locals.clone(),
                 });
                 task.ip = 0;
-                                Ok(true)
+                Ok(true)
             }
             Instr::CallMethod(m) => {
                 let method = prog.strings[m as usize].clone();
@@ -727,7 +724,8 @@ impl<'a> Runtime<'a> {
                         };
                         let args = collect_args(&mut task.stack, argc)?;
                         let recv = args[0].deref();
-                        let blocked = self.chan_method(&mut task.stack, recv, &method, &args[1..], id)?;
+                        let blocked =
+                            self.chan_method(&mut task.stack, recv, &method, &args[1..], id)?;
                         if !blocked && method == "recv" {
                             // Blocked recv: retry CallMethod after being woken
                             // by re-executing it (args restored on the stack).
@@ -762,7 +760,7 @@ impl<'a> Runtime<'a> {
                         },
                         0,
                         0,
-                    ))
+                    ));
                 };
                 let f = &prog.functions[fi];
                 let argc = f.nparams as usize;
@@ -840,13 +838,7 @@ impl<'a> Runtime<'a> {
                     Value::Range { start, end } => IterState::Range { cur: start, end },
                     Value::List(items) => IterState::List { items, idx: 0 },
                     Value::Chan(chan) => IterState::Chan { chan },
-                    other => {
-                        return Err(err(
-                            Msg::ForNotSupported(other.type_tag().into()),
-                            0,
-                            0,
-                        ))
-                    }
+                    other => return Err(err(Msg::ForNotSupported(other.type_tag().into()), 0, 0)),
                 };
                 task.iters.push(iter);
                 Ok(true)
@@ -887,7 +879,11 @@ impl<'a> Runtime<'a> {
                         let mut c = chan.borrow_mut();
                         if let Some(v) = c.buf.pop_front() {
                             // A slot freed: admit a blocked sender.
-                            if let Some(pos) = self.pending_sends.iter().position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan)) {
+                            if let Some(pos) = self
+                                .pending_sends
+                                .iter()
+                                .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
+                            {
                                 if let Some((_, v2, sender)) = self.pending_sends.remove(pos) {
                                     c.buf.push_back(v2);
                                     self.task_states[sender] = TaskState::Ready;
@@ -897,7 +893,11 @@ impl<'a> Runtime<'a> {
                             task.iters.push(IterState::Chan { chan });
                             task.stack.push(v);
                             Ok(true)
-                        } else if let Some(pos) = self.pending_sends.iter().position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan)) {
+                        } else if let Some(pos) = self
+                            .pending_sends
+                            .iter()
+                            .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
+                        {
                             if let Some((_, v, sender)) = self.pending_sends.remove(pos) {
                                 self.task_states[sender] = TaskState::Ready;
                                 drop(c);
@@ -964,7 +964,11 @@ impl<'a> Runtime<'a> {
                 let mut c = chan.borrow_mut();
                 if let Some(v) = c.buf.pop_front() {
                     // A slot freed up: admit a waiting sender if any.
-                    if let Some(pos) = self.pending_sends.iter().position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan)) {
+                    if let Some(pos) = self
+                        .pending_sends
+                        .iter()
+                        .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
+                    {
                         if let Some((_, v2, sender)) = self.pending_sends.remove(pos) {
                             c.buf.push_back(v2);
                             self.task_states[sender] = TaskState::Ready;
@@ -972,7 +976,11 @@ impl<'a> Runtime<'a> {
                     }
                     task.stack.push(v);
                     Ok(true)
-                } else if let Some(pos) = self.pending_sends.iter().position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan)) {
+                } else if let Some(pos) = self
+                    .pending_sends
+                    .iter()
+                    .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
+                {
                     // Hand the value over directly (unbuffered rendezvous).
                     if let Some((_, v, sender)) = self.pending_sends.remove(pos) {
                         self.task_states[sender] = TaskState::Ready;
@@ -1100,7 +1108,14 @@ impl<'a> Runtime<'a> {
         args: &[Value],
     ) -> Result<bool, VmError> {
         let Value::List(items) = recv else {
-            return Err(err(Msg::UnknownMethod { ty: recv.type_tag().into(), method: method.into() }, 0, 0));
+            return Err(err(
+                Msg::UnknownMethod {
+                    ty: recv.type_tag().into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            ));
         };
         match method {
             "len" => {
@@ -1138,7 +1153,14 @@ impl<'a> Runtime<'a> {
                 stack.push(Value::Unit);
                 Ok(true)
             }
-            _ => Err(err(Msg::UnknownMethod { ty: "List".into(), method: method.into() }, 0, 0)),
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "List".into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            )),
         }
     }
 
@@ -1151,7 +1173,14 @@ impl<'a> Runtime<'a> {
         task_id: usize,
     ) -> Result<bool, VmError> {
         let Value::Chan(chan) = recv else {
-            return Err(err(Msg::UnknownMethod { ty: recv.type_tag().into(), method: method.into() }, 0, 0));
+            return Err(err(
+                Msg::UnknownMethod {
+                    ty: recv.type_tag().into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            ));
         };
         match method {
             "send" => {
@@ -1185,7 +1214,11 @@ impl<'a> Runtime<'a> {
             "recv" => {
                 let mut c = chan.borrow_mut();
                 if let Some(v) = c.buf.pop_front() {
-                    if let Some(pos) = self.pending_sends.iter().position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan)) {
+                    if let Some(pos) = self
+                        .pending_sends
+                        .iter()
+                        .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
+                    {
                         if let Some((_, v2, sender)) = self.pending_sends.remove(pos) {
                             c.buf.push_back(v2);
                             self.task_states[sender] = TaskState::Ready;
@@ -1193,7 +1226,11 @@ impl<'a> Runtime<'a> {
                     }
                     stack.push(v);
                     Ok(true)
-                } else if let Some(pos) = self.pending_sends.iter().position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan)) {
+                } else if let Some(pos) = self
+                    .pending_sends
+                    .iter()
+                    .position(|(ch2, _, _)| Rc::ptr_eq(ch2, &chan))
+                {
                     if let Some((_, v, sender)) = self.pending_sends.remove(pos) {
                         self.task_states[sender] = TaskState::Ready;
                         stack.push(v);
@@ -1221,7 +1258,14 @@ impl<'a> Runtime<'a> {
                 stack.push(Value::Unit);
                 Ok(true)
             }
-            _ => Err(err(Msg::UnknownMethod { ty: "Chan".into(), method: method.into() }, 0, 0)),
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "Chan".into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            )),
         }
     }
 }
@@ -1272,9 +1316,7 @@ fn binary(op: BinOp, l: Value, r: Value) -> Result<Value, Msg> {
             (Value::Int(a), Value::Float(b)) => float_op(op, *a as f64, *b),
             (Value::Float(a), Value::Int(b)) => float_op(op, *a, *b as f64),
             (Value::Float(a), Value::Float(b)) => float_op(op, *a, *b),
-            (Value::Str(a), Value::Str(b)) if op == Add => {
-                Ok(Value::Str(format!("{}{}", a, b)))
-            }
+            (Value::Str(a), Value::Str(b)) if op == Add => Ok(Value::Str(format!("{}{}", a, b))),
             _ => Err(Msg::TypeMismatch),
         },
         Eq | Ne | Lt | Le | Gt | Ge => cmp_op(op, &l, &r),

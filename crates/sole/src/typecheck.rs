@@ -546,10 +546,7 @@ impl<'a> Checker<'a> {
                         let _ = index;
                         Ok((root.clone(), Some(inner.as_ref().clone())))
                     }
-                    other => Err(err(
-                        Msg::UnknownBorrowTarget(other.name()),
-                        *span,
-                    )),
+                    other => Err(err(Msg::UnknownBorrowTarget(other.name()), *span)),
                 }
             }
             Expr::Field { obj, name, span } => {
@@ -661,8 +658,7 @@ impl<'a> Checker<'a> {
             .borrows
             .keys()
             .filter(|r| {
-                !outer_borrows.contains(r)
-                    && last_uses.get(*r).copied().unwrap_or(0) <= stmt_idx
+                !outer_borrows.contains(r) && last_uses.get(*r).copied().unwrap_or(0) <= stmt_idx
             })
             .cloned()
             .collect();
@@ -693,8 +689,7 @@ impl<'a> Checker<'a> {
                 // releases at r's last use.
                 if let Expr::Borrow { expr, mutable, .. } = value {
                     if let Ok((target, _)) = self.borrow_path(expr) {
-                        self.borrows
-                            .insert(name.clone(), (target, *mutable));
+                        self.borrows.insert(name.clone(), (target, *mutable));
                     }
                 }
                 // Annotated list: check each element against the inner type,
@@ -745,10 +740,7 @@ impl<'a> Checker<'a> {
                     .cloned()
                     .ok_or_else(|| err(Msg::UndefinedVariable(name.clone()), *span))?;
                 if !var.mutable {
-                    return Err(err(
-                        Msg::ImmutableReassign(name.clone()),
-                        *span,
-                    ));
+                    return Err(err(Msg::ImmutableReassign(name.clone()), *span));
                 }
                 let expected = var.ty;
                 let actual = self.infer_expr_consume_skip(value, *span, name)?;
@@ -1257,9 +1249,8 @@ impl<'a> Checker<'a> {
                         Expr::Ident(n, _) => n.clone(),
                         _ => return Err(err(Msg::UnknownType("<chan elem>".into()), span)),
                     };
-                    let elem = Ty::from_name(&elem_name).ok_or_else(|| {
-                        err(Msg::UnknownType(elem_name.clone()), span)
-                    })?;
+                    let elem = Ty::from_name(&elem_name)
+                        .ok_or_else(|| err(Msg::UnknownType(elem_name.clone()), span))?;
                     if args.len() > 1 {
                         return Err(err(Msg::ArgCount("Chan".into(), 1, args.len()), span));
                     }
@@ -2082,7 +2073,8 @@ mod tests {
     #[test]
     fn mutable_borrow_conflicts() {
         // r1 alive when r2 is created → conflict.
-        let msg = check_err("let a = [1, 2]\nlet r1 = ref a\nlet r2 = mut ref a\nprint(r1.len())\n");
+        let msg =
+            check_err("let a = [1, 2]\nlet r1 = ref a\nlet r2 = mut ref a\nprint(r1.len())\n");
         assert!(msg.contains("[E0403]"), "msg: {msg}");
     }
 
