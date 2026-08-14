@@ -59,7 +59,7 @@ fn main() -> ExitCode {
                 }
             };
             match cmd.as_deref() {
-                Some("test") => match sole::run_tests(&source) {
+                Some("test") => match sole::run_tests_at(&source, &path) {
                     Ok(results) => {
                         let mut failed = 0;
                         for (name, outcome) in &results {
@@ -83,7 +83,7 @@ fn main() -> ExitCode {
                         ExitCode::from(1)
                     }
                 },
-                _ => match sole::run_source(&source) {
+                _ => match sole::run_file(&path) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(msg) => {
                         eprintln!("error: {}", msg);

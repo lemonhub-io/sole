@@ -1,0 +1,22 @@
+# M4 阶段 1: 标准库 — 文件 IO / 时间 / 数学 / JSON / 模块
+import std_math_lib
+
+let path = "examples/out.txt"
+let r = write(path, "hello from stdlib\n")
+print(r.is_ok())
+
+let s = read_to_str(path)
+print(s.unwrap())
+
+print(clock() > 0)
+print(abs(-5))
+print(sqrt(16.0))
+print(pow(2.0, 8.0))
+
+let data = json_decode("{\"name\": \"sole\", \"year\": 2026}")
+print(data.is_ok())
+let obj = data.unwrap()
+print(obj["name"])
+print(obj["year"])
+
+print(std_math_lib.cube(3))

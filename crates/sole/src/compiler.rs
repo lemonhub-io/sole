@@ -76,6 +76,9 @@ pub fn compile(program: &Program) -> Result<CompiledProgram, String> {
         if let Item::Impl(imp) = item {
             c.compile_impl(imp)?;
         }
+        // Item::Import is resolved by the loader / type checker; it
+        // produces no code.
+        let _ = item;
     }
     Ok(CompiledProgram {
         functions: c.functions,
@@ -522,6 +525,13 @@ impl<'a> Compiler<'a> {
                             code.push(Instr::BuiltinPrint(args.len() as u32));
                             return Ok(());
                         }
+                        n if is_std_builtin(n) => {
+                            for a in args {
+                                self.compile_expr(a, code, ctx)?;
+                            }
+                            code.push(Instr::Builtin(std_builtin_id(n)));
+                            return Ok(());
+                        }
                         "range" => {
                             // `range(n)` = `range(0, n)`: push the default
                             // start so BuiltinRange always pops two values.
@@ -577,6 +587,30 @@ impl<'a> Compiler<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// Standard-library builtins (IO / time / math / JSON). They are global
+/// functions backed by the VM, keeping the stdlib dependency-free.
+pub fn is_std_builtin(name: &str) -> bool {
+    std_builtin_id(name) != 0
+}
+
+pub fn std_builtin_id(name: &str) -> u8 {
+    match name {
+        "read_to_str" => 1,
+        "write" => 2,
+        "clock" => 3,
+        "sleep" => 4,
+        "abs" => 5,
+        "floor" => 6,
+        "ceil" => 7,
+        "round" => 8,
+        "sqrt" => 9,
+        "pow" => 10,
+        "json_encode" => 11,
+        "json_decode" => 12,
+        _ => 0,
     }
 }
 

@@ -28,6 +28,7 @@ pub struct Program {
 pub enum Item {
     Fn(FnDef),
     Test(TestDef),
+    Import(ImportDef),
     Struct(StructDef),
     Interface(InterfaceDef),
     Impl(ImplDef),
@@ -47,6 +48,13 @@ pub struct FnDef {
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDef {
+    pub module: String,
+    pub names: Vec<String>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -351,6 +359,9 @@ impl<'a> Parser<'a> {
         if self.at(&TokenKind::Test) {
             return self.parse_test().map(Item::Test);
         }
+        if self.at(&TokenKind::Import) || self.at(&TokenKind::From) {
+            return self.parse_import().map(Item::Import);
+        }
         self.parse_stmt().map(Item::Stmt)
     }
 
@@ -522,6 +533,32 @@ impl<'a> Parser<'a> {
             params,
             ret,
             body,
+        })
+    }
+
+    fn parse_import(&mut self) -> Result<ImportDef, ParseError> {
+        let span = self.here_span();
+        let module;
+        let mut names;
+        if self.at(&TokenKind::From) {
+            self.advance();
+            module = self.expect_ident(IdentKind::TypeName)?;
+            self.expect(&TokenKind::Import, "import")?;
+            names = vec![self.expect_ident(IdentKind::FnName)?];
+            while self.at(&TokenKind::Comma) {
+                self.advance();
+                names.push(self.expect_ident(IdentKind::FnName)?);
+            }
+        } else {
+            self.advance();
+            module = self.expect_ident(IdentKind::TypeName)?;
+            names = Vec::new();
+        }
+        self.expect_stmt_end()?;
+        Ok(ImportDef {
+            module,
+            names,
+            span,
         })
     }
 

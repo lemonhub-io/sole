@@ -32,6 +32,7 @@ pub enum Ty {
     Dict(Box<Ty>, Box<Ty>),
     Set(Box<Ty>),
     Tuple(Vec<Ty>),
+    Json,
     Struct(String),
     Interface(String),
     Ref(Box<Ty>),
@@ -71,6 +72,7 @@ impl Ty {
                 ts.iter().map(Ty::name).collect::<Vec<_>>().join(", ")
             ),
             Ty::TypeVar(name) => name.clone(),
+            Ty::Json => "Json".into(),
             Ty::Struct(name) => name.clone(),
             Ty::Interface(name) => name.clone(),
             Ty::Ref(inner) => format!("ref {}", inner.name()),
@@ -88,6 +90,7 @@ impl Ty {
                 | Ty::Ref(_)
                 | Ty::Chan(_)
                 | Ty::TypeVar(_)
+                | Ty::Json
                 | Ty::Fn
                 | Ty::Unknown
         )
@@ -215,6 +218,7 @@ pub fn check(program: &Program) -> Result<(), TypeError> {
         .collect();
     checker.check_block(&Block { stmts: top_stmts })?;
     checker.vars.pop();
+    checker.check_imports()?;
     checker.check_functions()?;
     checker.check_tests()?;
     Ok(())
@@ -1213,6 +1217,9 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
+                    if Self::is_hole(&vt) {
+                        continue;
+                    }
                     match &val_ty {
                         None => val_ty = Some(vt),
                         Some(e) => {
@@ -1268,6 +1275,9 @@ impl<'a> Checker<'a> {
                 let mut elem_ty: Option<Ty> = None;
                 for it in items {
                     let t = self.infer_expr_consume(it, *span)?;
+                    if Self::is_hole(&t) {
+                        continue;
+                    }
                     match &elem_ty {
                         None => elem_ty = Some(t),
                         Some(e) => {
@@ -1377,6 +1387,7 @@ impl<'a> Checker<'a> {
                         }
                         Ok(v.as_ref().clone())
                     }
+                    Ty::Json => Ok(Ty::Json),
                     Ty::Unknown => Ok(Ty::Unknown),
                     other => Err(err(Msg::IndexOnNonList(other.name()), *span)),
                 }
@@ -1455,6 +1466,8 @@ impl<'a> Checker<'a> {
                         | (Ty::Bool, Ty::Bool)
                         | (Ty::TypeVar(_), _)
                         | (_, Ty::TypeVar(_))
+                        | (Ty::Json, _)
+                        | (_, Ty::Json)
                         | (Ty::Unknown, _)
                         | (_, Ty::Unknown)
                 );
@@ -1543,6 +1556,150 @@ impl<'a> Checker<'a> {
                         self.infer_expr(a)?;
                     }
                     return Ok(Ty::Unit);
+                }
+                "read_to_str" | "json_decode" => {
+                    if args.len() != 1 {
+                        return Err(err(Msg::ArgCount(name.clone(), 1, args.len()), span));
+                    }
+                    let t = self.infer_expr(&args[0])?;
+                    if !matches!(t.deref(), Ty::Str | Ty::Unknown) {
+                        return Err(err(
+                            Msg::ArgTypeMismatch {
+                                func: name.clone(),
+                                index: 0,
+                                expected: "str".into(),
+                                actual: t.name(),
+                            },
+                            span,
+                        ));
+                    }
+                    let ok = if name == "read_to_str" {
+                        Ty::Str
+                    } else {
+                        Ty::Json
+                    };
+                    return Ok(Ty::Result(Box::new(ok), Box::new(Ty::Str)));
+                }
+                "write" => {
+                    if args.len() != 2 {
+                        return Err(err(Msg::ArgCount("write".into(), 2, args.len()), span));
+                    }
+                    for a in args {
+                        let t = self.infer_expr(a)?;
+                        if !matches!(t.deref(), Ty::Str | Ty::Unknown) {
+                            return Err(err(
+                                Msg::ArgTypeMismatch {
+                                    func: "write".into(),
+                                    index: 0,
+                                    expected: "str".into(),
+                                    actual: t.name(),
+                                },
+                                span,
+                            ));
+                        }
+                    }
+                    return Ok(Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Str)));
+                }
+                "abs" => {
+                    if args.len() != 1 {
+                        return Err(err(Msg::ArgCount("abs".into(), 1, args.len()), span));
+                    }
+                    let t = self.infer_expr(&args[0])?;
+                    match t.deref() {
+                        Ty::Int => return Ok(Ty::Int),
+                        Ty::Float => return Ok(Ty::Float),
+                        Ty::Unknown | Ty::TypeVar(_) => return Ok(Ty::Unknown),
+                        other => {
+                            return Err(err(
+                                Msg::ArgTypeMismatch {
+                                    func: "abs".into(),
+                                    index: 0,
+                                    expected: "int or float".into(),
+                                    actual: other.name(),
+                                },
+                                span,
+                            ))
+                        }
+                    }
+                }
+                "clock" => {
+                    if !args.is_empty() {
+                        return Err(err(Msg::ArgCount("clock".into(), 0, args.len()), span));
+                    }
+                    return Ok(Ty::Int);
+                }
+                "sleep" => {
+                    if args.len() != 1 {
+                        return Err(err(Msg::ArgCount("sleep".into(), 1, args.len()), span));
+                    }
+                    let t = self.infer_expr(&args[0])?;
+                    if !matches!(t.deref(), Ty::Int | Ty::Unknown) {
+                        return Err(err(
+                            Msg::ArgTypeMismatch {
+                                func: "sleep".into(),
+                                index: 0,
+                                expected: "int".into(),
+                                actual: t.name(),
+                            },
+                            span,
+                        ));
+                    }
+                    return Ok(Ty::Unit);
+                }
+                "floor" | "ceil" | "round" => {
+                    if args.len() != 1 {
+                        return Err(err(Msg::ArgCount(name.clone(), 1, args.len()), span));
+                    }
+                    let t = self.infer_expr(&args[0])?;
+                    if !matches!(t.deref(), Ty::Float | Ty::Int | Ty::Unknown) {
+                        return Err(err(
+                            Msg::ArgTypeMismatch {
+                                func: name.clone(),
+                                index: 0,
+                                expected: "float".into(),
+                                actual: t.name(),
+                            },
+                            span,
+                        ));
+                    }
+                    return Ok(Ty::Int);
+                }
+                "sqrt" | "pow" => {
+                    if args.len() != (if name == "sqrt" { 1 } else { 2 }) {
+                        return Err(err(
+                            Msg::ArgCount(
+                                name.clone(),
+                                if name == "sqrt" { 1 } else { 2 },
+                                args.len(),
+                            ),
+                            span,
+                        ));
+                    }
+                    for a in args {
+                        let t = self.infer_expr(a)?;
+                        if !matches!(t.deref(), Ty::Float | Ty::Int | Ty::Unknown) {
+                            return Err(err(
+                                Msg::ArgTypeMismatch {
+                                    func: name.clone(),
+                                    index: 0,
+                                    expected: "float".into(),
+                                    actual: t.name(),
+                                },
+                                span,
+                            ));
+                        }
+                    }
+                    return Ok(Ty::Float);
+                }
+                "json_encode" => {
+                    if args.len() != 1 {
+                        return Err(err(
+                            Msg::ArgCount("json_encode".into(), 1, args.len()),
+                            span,
+                        ));
+                    }
+                    self.infer_expr(&args[0])?;
+                    return Ok(Ty::Str);
                 }
                 "range" => {
                     for (i, a) in args.iter().enumerate() {
@@ -2394,6 +2551,28 @@ impl<'a> Checker<'a> {
 
     /// Checks `test` blocks as parameter-less bodies (no callable
     /// registration: they run only under `sole test`).
+    /// `from foo import a, b`: every imported name must exist as a global
+    /// function or type. (The symbol table is shared across modules.)
+    fn check_imports(&mut self) -> Result<(), TypeError> {
+        for item in &self.program.items {
+            if let Item::Import(imp) = item {
+                for name in &imp.names {
+                    if !self.fns.contains_key(name)
+                        && !self.structs.contains_key(name)
+                        && !self.interfaces.contains_key(name)
+                        && name != "None"
+                    {
+                        return Err(err(
+                            Msg::UndefinedVariable(format!("{}::{}", imp.module, name)),
+                            imp.span,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn check_tests(&mut self) -> Result<(), TypeError> {
         for item in &self.program.items {
             if let Item::Test(t) = item {
@@ -2431,6 +2610,15 @@ impl<'a> Checker<'a> {
 
     /// Whether `actual` can be used where `expected` is declared.
     /// `Struct` implements `Interface` when an `impl T: I` exists.
+    /// `None` inside a collection literal is a "hole": it never forces the
+    /// element type (JSON-style heterogeneous literals like `[true, None]`).
+    fn is_hole(t: &Ty) -> bool {
+        matches!(
+            t,
+            Ty::Option(inner) if matches!(inner.as_ref(), Ty::Unknown)
+        )
+    }
+
     fn is_compatible(&self, expected: &Ty, actual: &Ty) -> bool {
         if types_compatible(expected, actual) {
             return true;

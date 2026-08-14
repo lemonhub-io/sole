@@ -37,6 +37,8 @@ pub enum TokenKind {
     Or,
     Not,
     Assert,
+    Import,
+    From,
     // Layout tokens
     Newline,
     Indent,
@@ -292,6 +294,8 @@ impl<'a> Lexer<'a> {
             "impl" => TokenKind::Impl,
             "test" => TokenKind::Test,
             "assert" => TokenKind::Assert,
+            "import" => TokenKind::Import,
+            "from" => TokenKind::From,
             "with" => TokenKind::With,
             "yield" => TokenKind::Yield,
             "task_group" => TokenKind::TaskGroup,

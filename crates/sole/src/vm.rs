@@ -148,6 +148,8 @@ pub enum Instr {
     MakeSet(u32),
     MakeTuple(u32),
     Assert,
+    /// Standard-library builtin by id (compiler::std_builtin_id).
+    Builtin(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1247,6 +1249,9 @@ impl<'a> Runtime<'a> {
                         return Err(err(Msg::AssertFailed, 0, 0));
                     }
                 }
+                Instr::Builtin(id) => {
+                    self.std_builtin(task, *id)?;
+                }
             }
         }
         Ok(true)
@@ -1618,6 +1623,175 @@ impl<'a> Runtime<'a> {
         }
     }
 
+    /// Runs a standard-library builtin (see `compiler::std_builtin_id`).
+    fn std_builtin(&mut self, task: &mut Task, id: u8) -> Result<(), VmError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let pop = |task: &mut Task| task.stack.pop().unwrap_or(Value::Unit);
+        match id {
+            1 => {
+                // read_to_str(path) -> Result[str, str]
+                let path = pop(task);
+                let Value::Str(p) = path else {
+                    return Err(err(
+                        Msg::BadCall("read_to_str needs a str path".into()),
+                        0,
+                        0,
+                    ));
+                };
+                let v = std::fs::read_to_string(p.as_ref()).map_err(|e| e.to_string());
+                task.stack.push(match v {
+                    Ok(s) => Value::Ok(Box::new(Value::Str(Rc::from(s)))),
+                    Err(e) => Value::Err(Box::new(Value::Str(Rc::from(e)))),
+                });
+            }
+            2 => {
+                // write(path, content) -> Result[(), str]
+                let content = pop(task);
+                let path = pop(task);
+                let Value::Str(p) = path else {
+                    return Err(err(Msg::BadCall("write needs a str path".into()), 0, 0));
+                };
+                let v = match content {
+                    Value::Str(c) => std::fs::write(p.as_ref(), c.as_ref()),
+                    other => {
+                        return Err(err(
+                            Msg::BadCall(format!(
+                                "write content must be a str, got {}",
+                                other.type_tag()
+                            )),
+                            0,
+                            0,
+                        ))
+                    }
+                };
+                task.stack.push(match v {
+                    Ok(()) => Value::Ok(Box::new(Value::Unit)),
+                    Err(e) => Value::Err(Box::new(Value::Str(Rc::from(e.to_string())))),
+                });
+            }
+            3 => {
+                // clock() -> int (ms since epoch)
+                let ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                task.stack.push(Value::Int(ms));
+            }
+            4 => {
+                // sleep(ms)
+                let v = pop(task);
+                let Value::Int(ms) = v else {
+                    return Err(err(Msg::BadCall("sleep needs an int".into()), 0, 0));
+                };
+                std::thread::sleep(std::time::Duration::from_millis(ms.max(0) as u64));
+                task.stack.push(Value::Unit);
+            }
+            5 => {
+                // abs(int) -> int; abs(float) -> float
+                let v = pop(task);
+                task.stack.push(match v {
+                    Value::Int(n) => Value::Int(n.wrapping_abs()),
+                    Value::Float(f) => Value::Float(f.abs()),
+                    other => {
+                        return Err(err(
+                            Msg::BadCall(format!(
+                                "abs needs int or float, got {}",
+                                other.type_tag()
+                            )),
+                            0,
+                            0,
+                        ))
+                    }
+                });
+            }
+            6..=8 => {
+                // floor / ceil / round(float) -> int
+                let v = pop(task);
+                let f = match v {
+                    Value::Float(f) => f,
+                    Value::Int(n) => n as f64,
+                    other => {
+                        return Err(err(
+                            Msg::BadCall(format!("math fn needs float, got {}", other.type_tag())),
+                            0,
+                            0,
+                        ))
+                    }
+                };
+                let r = match id {
+                    6 => f.floor(),
+                    7 => f.ceil(),
+                    _ => f.round(),
+                };
+                task.stack.push(Value::Int(r as i64));
+            }
+            9 => {
+                // sqrt(float) -> float
+                let v = pop(task);
+                let f = match v {
+                    Value::Float(f) => f,
+                    Value::Int(n) => n as f64,
+                    other => {
+                        return Err(err(
+                            Msg::BadCall(format!("sqrt needs float, got {}", other.type_tag())),
+                            0,
+                            0,
+                        ))
+                    }
+                };
+                task.stack.push(Value::Float(f.sqrt()));
+            }
+            10 => {
+                // pow(x, y) -> float
+                let y = pop(task);
+                let x = pop(task);
+                let to_f = |v: Value| -> Result<f64, VmError> {
+                    match v {
+                        Value::Float(f) => Ok(f),
+                        Value::Int(n) => Ok(n as f64),
+                        other => Err(err(
+                            Msg::BadCall(format!("pow needs floats, got {}", other.type_tag())),
+                            0,
+                            0,
+                        )),
+                    }
+                };
+                task.stack.push(Value::Float(to_f(x)?.powf(to_f(y)?)));
+            }
+            11 => {
+                // json_encode(v) -> str
+                let v = pop(task);
+                match value_to_json(&v) {
+                    Some(j) => task.stack.push(Value::Str(Rc::from(j.to_string()))),
+                    None => {
+                        return Err(err(
+                            Msg::BadCall("json_encode: value is not JSON-encodable".into()),
+                            0,
+                            0,
+                        ))
+                    }
+                }
+            }
+            12 => {
+                // json_decode(s) -> Result[Json, str]
+                let s = pop(task);
+                let Value::Str(s) = s else {
+                    return Err(err(Msg::BadCall("json_decode needs a str".into()), 0, 0));
+                };
+                match serde_json::from_str::<serde_json::Value>(s.as_ref()) {
+                    Ok(j) => task.stack.push(Value::Ok(Box::new(json_to_value(&j)))),
+                    Err(e) => task
+                        .stack
+                        .push(Value::Err(Box::new(Value::Str(Rc::from(e.to_string()))))),
+                }
+            }
+            _ => {
+                return Err(err(Msg::InternalFnIndex, 0, 0));
+            }
+        }
+        Ok(())
+    }
+
     fn list_method(
         &mut self,
         stack: &mut Vec<Value>,
@@ -1797,6 +1971,58 @@ fn collect_args(stack: &mut Vec<Value>, n: usize) -> Result<Vec<Value>, VmError>
     Ok(args)
 }
 
+/// Converts a runtime value to a JSON value (None for non-JSON values).
+fn value_to_json(v: &Value) -> Option<serde_json::Value> {
+    use serde_json::Value as J;
+    Some(match v {
+        Value::Int(n) => J::Number((*n).into()),
+        Value::Float(f) => J::from(*f),
+        Value::Bool(b) => J::Bool(*b),
+        Value::Str(s) => J::String(s.to_string()),
+        Value::List(items) => {
+            let arr: Vec<J> = items.borrow().iter().filter_map(value_to_json).collect();
+            J::Array(arr)
+        }
+        Value::Dict(pairs) => {
+            let mut map = serde_json::Map::new();
+            for (k, val) in pairs.borrow().iter() {
+                let Value::Str(key) = k else { return None };
+                map.insert(key.to_string(), value_to_json(val)?);
+            }
+            J::Object(map)
+        }
+        Value::None => J::Null,
+        _ => return None,
+    })
+}
+
+/// Converts a parsed JSON value back into a runtime value.
+fn json_to_value(j: &serde_json::Value) -> Value {
+    match j {
+        serde_json::Value::Null => Value::None,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else {
+                Value::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => Value::Str(Rc::from(s.as_str())),
+        serde_json::Value::Array(items) => {
+            let vals: Vec<Value> = items.iter().map(json_to_value).collect();
+            Value::List(Rc::new(RefCell::new(vals)))
+        }
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<(Value, Value)> = map
+                .iter()
+                .map(|(k, v)| (Value::Str(Rc::from(k.as_str())), json_to_value(v)))
+                .collect();
+            Value::Dict(Rc::new(RefCell::new(pairs)))
+        }
+    }
+}
+
 fn truthy(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
@@ -1892,6 +2118,11 @@ fn cmp_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, Msg> {
             Eq => a == b,
             Ne => a != b,
             _ => return Err(Msg::BoolOrderCmp),
+        },
+        (Value::None, Value::None) => match op {
+            Eq => true,
+            Ne => false,
+            _ => return Err(Msg::CmpMismatch),
         },
         _ => return Err(Msg::CmpMismatch),
     };

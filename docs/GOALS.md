@@ -201,6 +201,21 @@
 - `assert <bool expr>` 语句 —— 失败时运行时错误 E0221;
   test 块与顶层均可使用
 
+### D13. 模块与标准库(2026-08-14 定)
+
+- **模块**: `import foo` 加载 `foo.sole`(相对当前文件目录,循环 import 静默去重);
+  `from foo import a, b` 显式导入名字(名称必须存在,否则 E0201)
+- **实现**: 编译期合并符号表(全局函数/类型表),`foo.symbol` 前缀在加载时
+  重写为全局符号——模块是"显式声明依赖",不做运行时隔离(诚实记录:隔离留待需求)
+- **标准库 = 内建函数**(无依赖、与 `print`/`range` 同级,全局可用):
+  - IO: `read_to_str(path) -> Result[str, str]`、`write(path, s) -> Result[(), str]`
+  - 时间: `clock() -> int`(毫秒)、`sleep(ms)`
+  - 数学: `abs`(int/float 同型)、`floor/ceil/round -> int`、`sqrt/pow -> float`
+  - JSON: `json_encode(v) -> str`、`json_decode(s) -> Result[Json, str]`;
+    `Json` 类型可索引(返回 Json),与 `None` 可比较
+- **后置**(§7.5/§6.1 按需): HTTP 客户端、`Shared[T]`/`Mutex`、包管理
+- 运行时线性容器(无哈希)与 `Json` 的动态性均为诚实记录的简化
+
 ---
 
 ## 4. 类型系统目标 (Type System)
@@ -437,6 +452,12 @@
 | 2026-08-11 | **M1 完成**: 新增 `sole-parser` AST 全节点 `Span`(行列)定位;新增 `sole` crate `typecheck` 模块(M1 简单静态类型检查: 标注/赋值/函数签名/运算符/迭代,错误码 E03xx 段);`run_source` 管线改为 lex → parse → typecheck → eval;求值错误带位置 | 对齐 M1 验收"简单类型检查"与 GOALS §9.2 错误定位要求 |
 | 2026-08-11 | 移除"iSH 内存受限、本地不运行 rustc、编译测试由 GitHub Actions 承担"的表述: 开发环境资源充足,编译/格式化/lint/测试恢复本地执行(README 与 §10.3 同步) | 开发环境变更,旧表述不再适用 |
 | 2026-08-11 | **M2 完成**: 类型系统扩展(List[T]/Struct/Interface/Ref/MutRef,含接口子类型兼容);新增 `struct`/`interface`/`impl` 语法与方法调用(含 `self` 借用);移动语义与借用检查(use-after-move/借用期间移动/可变借用冲突/借用逃逸,错误码 E04xx 段);eval 改造为 `Rc<RefCell>` 单元实现引用共享;List 字面量/索引/内置方法;字段赋值 `obj.field = v` | 对齐 M2 验收"静态类型检查器(完整,含移动语义与最小借用规则)";借用为最小规则集,字段级借用与借用传播已支持,索引借用与细粒度留 M3 |
+| 2026-08-14 | **M4 阶段 1(标准库核心)**: 定 D13 并实现——`import`/`from`
+    模块机制(多文件加载、循环去重、前缀重写、from 名称校验);
+    标准库内建函数: 文件 IO(read_to_str/write)、时间(clock/sleep)、
+    数学(abs/floor/ceil/round/sqrt/pow)、JSON(json_encode/json_decode +
+    Json 动态类型);`None` 在集合字面量中作"洞"支持异构 JSON 字面量 |
+    模块化 + 标准库核心全链路可用,单测覆盖;HTTP/Shared/Mutex 按 D13 后置 |
 | 2026-08-14 | **M4 阶段 0(语言地基)**: 定 D8-D12 并实现——`Option[T]`/`Result[T,E]`
    构造与解包(Some/None/Ok/Err、is_some/is_none/is_ok/is_err/unwrap,错误码 E0219/E0220);
    泛型函数与 `Comparable` 约束(E0320)、调用点实例化;
