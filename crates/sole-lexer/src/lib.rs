@@ -36,6 +36,7 @@ pub enum TokenKind {
     And,
     Or,
     Not,
+    Assert,
     // Layout tokens
     Newline,
     Indent,
@@ -67,6 +68,8 @@ pub enum TokenKind {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,6 +291,7 @@ impl<'a> Lexer<'a> {
             "interface" => TokenKind::Interface,
             "impl" => TokenKind::Impl,
             "test" => TokenKind::Test,
+            "assert" => TokenKind::Assert,
             "with" => TokenKind::With,
             "yield" => TokenKind::Yield,
             "task_group" => TokenKind::TaskGroup,
@@ -439,6 +443,14 @@ impl<'a> Lexer<'a> {
             b']' => {
                 self.advance();
                 self.push(TokenKind::RBracket, sl, sc);
+            }
+            b'{' => {
+                self.advance();
+                self.push(TokenKind::LBrace, sl, sc);
+            }
+            b'}' => {
+                self.advance();
+                self.push(TokenKind::RBrace, sl, sc);
             }
             _ => {
                 return Err(self.error(Msg::UnknownChar(c as char)));

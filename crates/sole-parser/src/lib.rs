@@ -27,6 +27,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Fn(FnDef),
+    Test(TestDef),
     Struct(StructDef),
     Interface(InterfaceDef),
     Impl(ImplDef),
@@ -34,11 +35,25 @@ pub enum Item {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name: String,
+    pub bound: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FnDef {
     pub name: String,
+    pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestDef {
+    pub name: String,
+    pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +165,10 @@ pub enum Stmt {
     Yield {
         span: Span,
     },
+    Assert {
+        expr: Expr,
+        span: Span,
+    },
 }
 
 impl Stmt {
@@ -166,7 +185,8 @@ impl Stmt {
             | Stmt::Continue { span }
             | Stmt::TaskGroup { span, .. }
             | Stmt::Go { span, .. }
-            | Stmt::Yield { span } => *span,
+            | Stmt::Yield { span }
+            | Stmt::Assert { span, .. } => *span,
             Stmt::Expr(e) => e.span(),
         }
     }
@@ -193,6 +213,9 @@ pub enum Expr {
     Bool(bool, Span),
     Ident(String, Span),
     List(Vec<Expr>, Span),
+    Dict(Vec<(Expr, Expr)>, Span),
+    Set(Vec<Expr>, Span),
+    Tuple(Vec<Expr>, Span),
     Unary {
         op: UnOp,
         expr: Box<Expr>,
@@ -234,7 +257,10 @@ impl Expr {
             | Expr::Str(_, s)
             | Expr::Bool(_, s)
             | Expr::Ident(_, s)
-            | Expr::List(_, s) => *s,
+            | Expr::List(_, s)
+            | Expr::Dict(_, s)
+            | Expr::Set(_, s)
+            | Expr::Tuple(_, s) => *s,
             Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
@@ -321,6 +347,9 @@ impl<'a> Parser<'a> {
         }
         if self.at(&TokenKind::Impl) {
             return self.parse_impl().map(Item::Impl);
+        }
+        if self.at(&TokenKind::Test) {
+            return self.parse_test().map(Item::Test);
         }
         self.parse_stmt().map(Item::Stmt)
     }
@@ -439,6 +468,32 @@ impl<'a> Parser<'a> {
     fn parse_fn(&mut self) -> Result<FnDef, ParseError> {
         self.expect(&TokenKind::Fn, "fn")?;
         let name = self.expect_ident(IdentKind::FnName)?;
+        let type_params = if self.at(&TokenKind::LBracket) {
+            self.advance();
+            let mut tps = Vec::new();
+            loop {
+                let tp_name = self.expect_ident(IdentKind::TypeName)?;
+                let bound = if self.at(&TokenKind::Colon) {
+                    self.advance();
+                    Some(self.expect_ident(IdentKind::TypeName)?)
+                } else {
+                    None
+                };
+                tps.push(TypeParam {
+                    name: tp_name,
+                    bound,
+                });
+                if self.at(&TokenKind::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            self.expect(&TokenKind::RBracket, "]")?;
+            tps
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LParen, "(")?;
         let mut params = Vec::new();
         if !self.at(&TokenKind::RParen) {
@@ -463,10 +518,21 @@ impl<'a> Parser<'a> {
         let body = self.parse_block()?;
         Ok(FnDef {
             name,
+            type_params,
             params,
             ret,
             body,
         })
+    }
+
+    fn parse_test(&mut self) -> Result<TestDef, ParseError> {
+        let span = self.here_span();
+        self.expect(&TokenKind::Test, "test")?;
+        let name = self.expect_ident(IdentKind::FnName)?;
+        self.expect(&TokenKind::Colon, ":")?;
+        self.expect_newline()?;
+        let body = self.parse_block()?;
+        Ok(TestDef { name, body, span })
     }
 
     fn parse_param(&mut self) -> Result<Param, ParseError> {
@@ -549,6 +615,13 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.expect_stmt_end()?;
                 Ok(Stmt::Continue { span })
+            }
+            Some(TokenKind::Assert) => {
+                let span = self.here_span();
+                self.advance();
+                let expr = self.parse_expr()?;
+                self.expect_stmt_end()?;
+                Ok(Stmt::Assert { expr, span })
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -981,10 +1054,54 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Ident(name, span))
             }
             Some(TokenKind::LParen) => {
+                let span = self.here_span();
                 self.advance();
-                let inner = self.parse_expr()?;
+                let mut items = vec![self.parse_expr()?];
+                while self.at(&TokenKind::Comma) {
+                    self.advance();
+                    items.push(self.parse_expr()?);
+                }
                 self.expect(&TokenKind::RParen, ")")?;
-                Ok(inner)
+                if items.len() == 1 {
+                    Ok(items.pop().unwrap())
+                } else {
+                    Ok(Expr::Tuple(items, span))
+                }
+            }
+            Some(TokenKind::LBrace) => {
+                let span = self.here_span();
+                self.advance();
+                let mut pairs = Vec::new();
+                let mut elems = Vec::new();
+                let mut is_dict = false;
+                let mut is_set = false;
+                if !self.at(&TokenKind::RBrace) {
+                    loop {
+                        let key = self.parse_expr()?;
+                        if self.at(&TokenKind::Colon) {
+                            self.advance();
+                            let value = self.parse_expr()?;
+                            pairs.push((key, value));
+                            is_dict = true;
+                        } else {
+                            elems.push(key);
+                            is_set = true;
+                        }
+                        if self.at(&TokenKind::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBrace, "}")?;
+                if is_dict {
+                    Ok(Expr::Dict(pairs, span))
+                } else if is_set {
+                    Ok(Expr::Set(elems, span))
+                } else {
+                    Ok(Expr::Dict(Vec::new(), span))
+                }
             }
             Some(TokenKind::LBracket) => {
                 let span = self.here_span();

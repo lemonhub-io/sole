@@ -157,6 +157,50 @@
 
 **设计理由(对 AI 友好)**: 默认不可变让 AI 生成的代码天然少一类 bug(意外改写共享数据);`mut` 的出现位置即文档,读代码 = 理解可变性边界。
 
+### D8. Option / Result: 显式错误处理的载体(2026-08-14 定)
+
+- **类型**: `Option[T]`、`Result[T, E]`(方括号泛型,见 D4)
+- **构造**: `Some(x)` / `None` / `Ok(x)` / `Err(x)` —— 编译期内建构造器;
+  `None` 裸标识符(无参数),`let x: Option[int] = None` 必须带标注
+- **解包**: 方法式,无模式匹配(P1 最小集):
+  - Option: `is_some()` / `is_none()` -> bool,`unwrap()` -> T(None 时报错 E0219)
+  - Result: `is_ok()` / `is_err()` -> bool,`unwrap()` -> T(Err 时报错 E0220)
+- **设计理由**: 无 null 字面量(§4.2)的落地;错误路径可见,AI 生成代码不会静默吞错
+
+### D9. 泛型函数(2026-08-14 定)
+
+- 语法: `fn max[T: Comparable](a: T, b: T) -> T` —— 方括号参数列表在函数名后,
+  冒号后为约束(可选);约束 `Comparable` = 支持 `==`/排序比较的类型
+  (int/float/bool/str)
+- 调用点实例化: 类型变量由实参推断,多实参绑定同一 `T` 必须一致;
+  约束违反报错 E0320;函数体内 `T` 按约束宽松检查
+- **不做**: 自定义泛型类型/接口(留待需求出现)
+
+### D10. Dict / Set / Tuple(2026-08-14 定)
+
+- `Dict[K, V]`: 字面量 `{"k": 1, "y": 2}`、索引 `d[k]`、
+  方法 `len` / `get(k) -> Option[V]` / `set(k, v)` / `contains(k)` / `remove(k)` /
+  `keys()` / `values()`
+- `Set[T]`: 字面量 `{1, 2, 3}`(无冒号元素;空 `{}` 二义 → 需要类型标注 E0318/E0319)、
+  方法 `len` / `add` / `contains` / `remove`;元素唯一
+- `Tuple[...]`: 括号字面量 `(1, "two")`(单元素 `(x)` 仍是括号)、索引 `t[0]`、
+  方法 `len`;无解构(最小集)
+- 运行时为线性结构(无哈希),性能后续按需优化(诚实记录)
+
+### D11. str 方法(2026-08-14 定)
+
+- `len()` / `sub(start, end)` / `split(sep)` / `join(List[str])` /
+  `contains(s)` / `starts_with(s)` / `ends_with(s)` / `to_str()`(任意值)
+- 解析: `to_int() -> Result[int, str]`、`to_float() -> Result[float, str]`
+  (parse 返回 Result,配合 D8)
+
+### D12. 测试原语(2026-08-14 定)
+
+- `test name:` + 缩进块 —— 顶层 item,普通运行不执行;
+  `sole test <file>` 逐个运行并报告 PASS/FAIL(退出码 1 = 有失败)
+- `assert <bool expr>` 语句 —— 失败时运行时错误 E0221;
+  test 块与顶层均可使用
+
 ---
 
 ## 4. 类型系统目标 (Type System)
@@ -393,4 +437,11 @@
 | 2026-08-11 | **M1 完成**: 新增 `sole-parser` AST 全节点 `Span`(行列)定位;新增 `sole` crate `typecheck` 模块(M1 简单静态类型检查: 标注/赋值/函数签名/运算符/迭代,错误码 E03xx 段);`run_source` 管线改为 lex → parse → typecheck → eval;求值错误带位置 | 对齐 M1 验收"简单类型检查"与 GOALS §9.2 错误定位要求 |
 | 2026-08-11 | 移除"iSH 内存受限、本地不运行 rustc、编译测试由 GitHub Actions 承担"的表述: 开发环境资源充足,编译/格式化/lint/测试恢复本地执行(README 与 §10.3 同步) | 开发环境变更,旧表述不再适用 |
 | 2026-08-11 | **M2 完成**: 类型系统扩展(List[T]/Struct/Interface/Ref/MutRef,含接口子类型兼容);新增 `struct`/`interface`/`impl` 语法与方法调用(含 `self` 借用);移动语义与借用检查(use-after-move/借用期间移动/可变借用冲突/借用逃逸,错误码 E04xx 段);eval 改造为 `Rc<RefCell>` 单元实现引用共享;List 字面量/索引/内置方法;字段赋值 `obj.field = v` | 对齐 M2 验收"静态类型检查器(完整,含移动语义与最小借用规则)";借用为最小规则集,字段级借用与借用传播已支持,索引借用与细粒度留 M3 |
+| 2026-08-14 | **M4 阶段 0(语言地基)**: 定 D8-D12 并实现——`Option[T]`/`Result[T,E]`
+   构造与解包(Some/None/Ok/Err、is_some/is_none/is_ok/is_err/unwrap,错误码 E0219/E0220);
+   泛型函数与 `Comparable` 约束(E0320)、调用点实例化;
+   `Dict[K,V]`(索引/方法,get 返回 Option)、`Set[T]`(元素唯一)、`Tuple`(索引);
+   str 方法集(len/sub/split/join/contains/starts_with/ends_with/to_str/to_int/to_float);
+   `test` 块 + `sole test` 运行器 + `assert` 语句(E0221);
+   结构化兼容 `Unknown` 洞(Option[?] ~ Option[int]) | M4 地基: 错误处理/泛型/集合/str/测试原语,全部有测试覆盖 |
 | 2026-08-14 | **M3 完成**: eval 迁移到字节码 VM(新增 `compiler.rs` AST→字节码、`vm.rs` stack VM);协程调度器与通道运行时(`go`/`task_group`/`Chan[T]` send/recv/close、缓冲/无缓冲、`for v in ch`、`yield`);性能优化: locals 值语义 + 惰性借用 cell、`Value` 缩至 24B(Str 用 `Rc<str>`、Struct 装箱)、`&Instr` 引用分派 + int 算术快路径、run-until-block 协作调度(与 §7.3"仅在通道操作与 yield 处切换"对齐)、零拷贝调用(局部变量直接放任务栈,Frame 改 base 索引)、当前函数 code 缓存、`CallMethod(m, argc)` 编码参数个数;新增 `bench/` 对比 CPython | 对齐 M3 验收"性能 ≥ CPython 同量级": fib(28)+sum_loop(1e6) 全程序 ~1.0x CPython(初版 3.7-4.4x),fib/sum_loop 单独均反超;详细数据见 bench/README |

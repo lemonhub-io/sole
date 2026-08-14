@@ -30,6 +30,13 @@ pub enum Value {
     List(Rc<RefCell<Vec<Value>>>),
     Struct(Box<StructVal>),
     Chan(Rc<RefCell<Channel>>),
+    None,
+    Some(Box<Value>),
+    Ok(Box<Value>),
+    Err(Box<Value>),
+    Dict(Rc<RefCell<Vec<(Value, Value)>>>),
+    Set(Rc<RefCell<Vec<Value>>>),
+    Tuple(Rc<Vec<Value>>),
     Ref(Rc<RefCell<Value>>),
     MutRef(Rc<RefCell<Value>>),
     Fn(usize),
@@ -74,6 +81,11 @@ impl Value {
             Value::List(_) => "List",
             Value::Struct(_) => "struct",
             Value::Chan(_) => "Chan",
+            Value::None | Value::Some(_) => "Option",
+            Value::Ok(_) | Value::Err(_) => "Result",
+            Value::Dict(_) => "Dict",
+            Value::Set(_) => "Set",
+            Value::Tuple(_) => "tuple",
             Value::Ref(_) | Value::MutRef(_) => "ref",
             Value::Fn(_) => "fn",
             Value::Unit => "()",
@@ -128,6 +140,14 @@ pub enum Instr {
     Binary(BinOp),
     /// Stops the current frame's function (implicit return at block end).
     RetUnit,
+    PushNone,
+    PushSome,
+    PushOk,
+    PushErr,
+    MakeDict(u32),
+    MakeSet(u32),
+    MakeTuple(u32),
+    Assert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -303,6 +323,12 @@ impl<'a> Runtime<'a> {
             pending_sends: VecDeque::new(),
             group_waiters: Vec::new(),
         }
+    }
+
+    /// Runs a single function in a fresh task (used by `sole test`).
+    pub fn run_function(&mut self, func: usize) -> Result<(), VmError> {
+        self.spawn(func, vec![], 0);
+        self.schedule_all()
     }
 
     /// Runs a compiled program to completion (top-level = implicit
@@ -624,17 +650,26 @@ impl<'a> Runtime<'a> {
                 Instr::IndexGet => {
                     let idx = task.stack.pop().unwrap_or(Value::Int(0));
                     let obj = task.stack.pop().unwrap_or(Value::Unit).deref();
-                    let Value::Int(i) = idx else {
-                        return Err(err(Msg::IndexNotInt, 0, 0));
-                    };
-                    let v = match obj {
-                        Value::List(items) => items
+                    let v = match (&obj, &idx) {
+                        (Value::List(items), Value::Int(i)) => items
                             .borrow()
-                            .get(i as usize)
+                            .get(*i as usize)
                             .cloned()
                             .unwrap_or(Value::Unit),
+                        (Value::Dict(pairs), key) => pairs
+                            .borrow()
+                            .iter()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::Unit),
+                        (Value::Tuple(items), Value::Int(i)) => {
+                            items.get(*i as usize).cloned().unwrap_or(Value::Unit)
+                        }
+                        (Value::List(_), _) | (Value::Tuple(_), _) => {
+                            return Err(err(Msg::IndexNotInt, 0, 0))
+                        }
                         other => {
-                            return Err(err(Msg::IndexOnNonList(other.type_tag().into()), 0, 0))
+                            return Err(err(Msg::IndexOnNonList(other.0.type_tag().into()), 0, 0))
                         }
                     };
                     task.stack.push(v);
@@ -746,8 +781,43 @@ impl<'a> Runtime<'a> {
                     // the total argument count (receiver included).
                     let argc = *argc as usize;
                     let recv = task.stack[task.stack.len().saturating_sub(argc)].clone();
+                    if method.as_ref() == "to_str" && argc == 1 {
+                        let recv = task.stack.pop().unwrap_or(Value::Unit);
+                        task.stack.push(Value::Str(Rc::from(recv.display())));
+                        continue;
+                    }
                     let ty = match recv.deref() {
                         Value::Struct(sv) => sv.name.clone(),
+                        Value::Str(_) => {
+                            let args = collect_args(&mut task.stack, argc)?;
+                            let recv = args[0].deref();
+                            return self.str_method(&mut task.stack, recv, &method, &args[1..]);
+                        }
+                        Value::Dict(_) => {
+                            let args = collect_args(&mut task.stack, argc)?;
+                            let recv = args[0].deref();
+                            return self.dict_method(&mut task.stack, recv, &method, &args[1..]);
+                        }
+                        Value::Set(_) => {
+                            let args = collect_args(&mut task.stack, argc)?;
+                            let recv = args[0].deref();
+                            return self.set_method(&mut task.stack, recv, &method, &args[1..]);
+                        }
+                        Value::Tuple(_) => {
+                            let args = collect_args(&mut task.stack, argc)?;
+                            let recv = args[0].deref();
+                            return self.tuple_method(&mut task.stack, recv, &method, &args[1..]);
+                        }
+                        Value::None | Value::Some(_) => {
+                            let args = collect_args(&mut task.stack, argc)?;
+                            let recv = args[0].deref();
+                            return self.option_method(&mut task.stack, recv, &method, &args[1..]);
+                        }
+                        Value::Ok(_) | Value::Err(_) => {
+                            let args = collect_args(&mut task.stack, argc)?;
+                            let recv = args[0].deref();
+                            return self.result_method(&mut task.stack, recv, &method, &args[1..]);
+                        }
                         Value::List(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
@@ -1123,9 +1193,429 @@ impl<'a> Runtime<'a> {
                         task.done = true;
                     }
                 }
+                Instr::PushNone => {
+                    task.stack.push(Value::None);
+                }
+                Instr::PushSome => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    task.stack.push(Value::Some(Box::new(v)));
+                }
+                Instr::PushOk => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    task.stack.push(Value::Ok(Box::new(v)));
+                }
+                Instr::PushErr => {
+                    let v = task.stack.pop().unwrap_or(Value::Unit);
+                    task.stack.push(Value::Err(Box::new(v)));
+                }
+                Instr::MakeDict(n) => {
+                    let mut pairs = Vec::with_capacity(*n as usize);
+                    for _ in 0..*n {
+                        let v = task.stack.pop().unwrap_or(Value::Unit);
+                        let k = task.stack.pop().unwrap_or(Value::Unit);
+                        pairs.push((k, v));
+                    }
+                    pairs.reverse();
+                    task.stack.push(Value::Dict(Rc::new(RefCell::new(pairs))));
+                }
+                Instr::MakeSet(n) => {
+                    let mut items = Vec::with_capacity(*n as usize);
+                    for _ in 0..*n {
+                        items.push(task.stack.pop().unwrap_or(Value::Unit));
+                    }
+                    items.reverse();
+                    // Set semantics: elements are unique.
+                    let mut seen: Vec<Value> = Vec::with_capacity(items.len());
+                    for it in items {
+                        if !seen.contains(&it) {
+                            seen.push(it);
+                        }
+                    }
+                    task.stack.push(Value::Set(Rc::new(RefCell::new(seen))));
+                }
+                Instr::MakeTuple(n) => {
+                    let mut items = Vec::with_capacity(*n as usize);
+                    for _ in 0..*n {
+                        items.push(task.stack.pop().unwrap_or(Value::Unit));
+                    }
+                    items.reverse();
+                    task.stack.push(Value::Tuple(Rc::new(items)));
+                }
+                Instr::Assert => {
+                    let v = task.stack.pop().unwrap_or(Value::Bool(false));
+                    if !truthy(&v) {
+                        return Err(err(Msg::AssertFailed, 0, 0));
+                    }
+                }
             }
         }
         Ok(true)
+    }
+
+    fn str_method(
+        &mut self,
+        stack: &mut Vec<Value>,
+        recv: Value,
+        method: &str,
+        args: &[Value],
+    ) -> Result<bool, VmError> {
+        let Value::Str(s) = recv else {
+            return Err(err(
+                Msg::UnknownMethod {
+                    ty: recv.type_tag().into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            ));
+        };
+        match method {
+            "len" => {
+                stack.push(Value::Int(s.len() as i64));
+                Ok(true)
+            }
+            "sub" => {
+                let Value::Int(start) = args.first().cloned().unwrap_or(Value::Int(0)) else {
+                    return Err(err(Msg::IndexNotInt, 0, 0));
+                };
+                let Value::Int(end) = args.get(1).cloned().unwrap_or(Value::Int(s.len() as i64))
+                else {
+                    return Err(err(Msg::IndexNotInt, 0, 0));
+                };
+                let start = start.max(0).min(s.len() as i64) as usize;
+                let end = end.max(0).min(s.len() as i64) as usize;
+                stack.push(Value::Str(Rc::from(if start <= end {
+                    &s[start..end]
+                } else {
+                    ""
+                })));
+                Ok(true)
+            }
+            "split" => {
+                let Value::Str(sep) = args.first().cloned().unwrap_or(Value::Str(" ".into()))
+                else {
+                    return Err(err(
+                        Msg::BadCall("split needs a str separator".into()),
+                        0,
+                        0,
+                    ));
+                };
+                let parts: Vec<Value> = s
+                    .split(sep.as_ref())
+                    .map(|p| Value::Str(Rc::from(p)))
+                    .collect();
+                stack.push(Value::List(Rc::new(RefCell::new(parts))));
+                Ok(true)
+            }
+            "join" => {
+                let Value::List(items) = args.first().cloned().unwrap_or(Value::Unit) else {
+                    return Err(err(Msg::BadCall("join needs a List[str]".into()), 0, 0));
+                };
+                let parts: Vec<String> = items
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Value::Str(t) => t.to_string(),
+                        other => other.display(),
+                    })
+                    .collect();
+                stack.push(Value::Str(Rc::from(parts.join(s.as_ref()))));
+                Ok(true)
+            }
+            "contains" => {
+                let Value::Str(sub) = args.first().cloned().unwrap_or(Value::Str("".into())) else {
+                    return Err(err(Msg::BadCall("contains needs a str".into()), 0, 0));
+                };
+                stack.push(Value::Bool(s.contains(sub.as_ref())));
+                Ok(true)
+            }
+            "starts_with" => {
+                let Value::Str(sub) = args.first().cloned().unwrap_or(Value::Str("".into())) else {
+                    return Err(err(Msg::BadCall("starts_with needs a str".into()), 0, 0));
+                };
+                stack.push(Value::Bool(s.starts_with(sub.as_ref())));
+                Ok(true)
+            }
+            "ends_with" => {
+                let Value::Str(sub) = args.first().cloned().unwrap_or(Value::Str("".into())) else {
+                    return Err(err(Msg::BadCall("ends_with needs a str".into()), 0, 0));
+                };
+                stack.push(Value::Bool(s.ends_with(sub.as_ref())));
+                Ok(true)
+            }
+            "to_int" => match s.parse::<i64>() {
+                Ok(n) => {
+                    stack.push(Value::Ok(Box::new(Value::Int(n))));
+                    Ok(true)
+                }
+                Err(e) => {
+                    stack.push(Value::Err(Box::new(Value::Str(Rc::from(e.to_string())))));
+                    Ok(true)
+                }
+            },
+            "to_float" => match s.parse::<f64>() {
+                Ok(f) => {
+                    stack.push(Value::Ok(Box::new(Value::Float(f))));
+                    Ok(true)
+                }
+                Err(e) => {
+                    stack.push(Value::Err(Box::new(Value::Str(Rc::from(e.to_string())))));
+                    Ok(true)
+                }
+            },
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "str".into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            )),
+        }
+    }
+
+    fn dict_method(
+        &mut self,
+        stack: &mut Vec<Value>,
+        recv: Value,
+        method: &str,
+        args: &[Value],
+    ) -> Result<bool, VmError> {
+        let Value::Dict(pairs) = recv else {
+            return Err(err(
+                Msg::UnknownMethod {
+                    ty: recv.type_tag().into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            ));
+        };
+        match method {
+            "len" => {
+                stack.push(Value::Int(pairs.borrow().len() as i64));
+                Ok(true)
+            }
+            "get" => {
+                let k = args.first().cloned().unwrap_or(Value::Unit);
+                let v = pairs
+                    .borrow()
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.clone())
+                    .map(|v| Value::Some(Box::new(v)))
+                    .unwrap_or(Value::None);
+                stack.push(v);
+                Ok(true)
+            }
+            "set" => {
+                let k = args.first().cloned().unwrap_or(Value::Unit);
+                let v = args.get(1).cloned().unwrap_or(Value::Unit);
+                let mut pairs = pairs.borrow_mut();
+                if let Some(slot) = pairs.iter_mut().find(|(key, _)| *key == k) {
+                    slot.1 = v;
+                } else {
+                    pairs.push((k, v));
+                }
+                stack.push(Value::Unit);
+                Ok(true)
+            }
+            "contains" => {
+                let k = args.first().cloned().unwrap_or(Value::Unit);
+                stack.push(Value::Bool(pairs.borrow().iter().any(|(key, _)| *key == k)));
+                Ok(true)
+            }
+            "remove" => {
+                let k = args.first().cloned().unwrap_or(Value::Unit);
+                pairs.borrow_mut().retain(|(key, _)| *key != k);
+                stack.push(Value::Unit);
+                Ok(true)
+            }
+            "keys" => {
+                let keys: Vec<Value> = pairs.borrow().iter().map(|(k, _)| k.clone()).collect();
+                stack.push(Value::List(Rc::new(RefCell::new(keys))));
+                Ok(true)
+            }
+            "values" => {
+                let values: Vec<Value> = pairs.borrow().iter().map(|(_, v)| v.clone()).collect();
+                stack.push(Value::List(Rc::new(RefCell::new(values))));
+                Ok(true)
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "Dict".into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            )),
+        }
+    }
+
+    fn set_method(
+        &mut self,
+        stack: &mut Vec<Value>,
+        recv: Value,
+        method: &str,
+        args: &[Value],
+    ) -> Result<bool, VmError> {
+        let Value::Set(items) = recv else {
+            return Err(err(
+                Msg::UnknownMethod {
+                    ty: recv.type_tag().into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            ));
+        };
+        match method {
+            "len" => {
+                stack.push(Value::Int(items.borrow().len() as i64));
+                Ok(true)
+            }
+            "add" => {
+                let v = args.first().cloned().unwrap_or(Value::Unit);
+                let mut items = items.borrow_mut();
+                if !items.contains(&v) {
+                    items.push(v);
+                }
+                stack.push(Value::Unit);
+                Ok(true)
+            }
+            "contains" => {
+                let v = args.first().cloned().unwrap_or(Value::Unit);
+                stack.push(Value::Bool(items.borrow().contains(&v)));
+                Ok(true)
+            }
+            "remove" => {
+                let v = args.first().cloned().unwrap_or(Value::Unit);
+                items.borrow_mut().retain(|x| *x != v);
+                stack.push(Value::Unit);
+                Ok(true)
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "Set".into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            )),
+        }
+    }
+
+    fn tuple_method(
+        &mut self,
+        stack: &mut Vec<Value>,
+        recv: Value,
+        method: &str,
+        _args: &[Value],
+    ) -> Result<bool, VmError> {
+        let Value::Tuple(items) = recv else {
+            return Err(err(
+                Msg::UnknownMethod {
+                    ty: recv.type_tag().into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            ));
+        };
+        match method {
+            "len" => {
+                stack.push(Value::Int(items.len() as i64));
+                Ok(true)
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "tuple".into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            )),
+        }
+    }
+
+    fn option_method(
+        &mut self,
+        stack: &mut Vec<Value>,
+        recv: Value,
+        method: &str,
+        _args: &[Value],
+    ) -> Result<bool, VmError> {
+        match (&recv, method) {
+            (Value::None, "is_none") => {
+                stack.push(Value::Bool(true));
+                Ok(true)
+            }
+            (Value::Some(_), "is_none") => {
+                stack.push(Value::Bool(false));
+                Ok(true)
+            }
+            (Value::Some(_), "is_some") => {
+                stack.push(Value::Bool(true));
+                Ok(true)
+            }
+            (Value::None, "is_some") => {
+                stack.push(Value::Bool(false));
+                Ok(true)
+            }
+            (Value::Some(v), "unwrap") => {
+                stack.push((**v).clone());
+                Ok(true)
+            }
+            (Value::None, "unwrap") => Err(err(Msg::UnwrapNone, 0, 0)),
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "Option".into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            )),
+        }
+    }
+
+    fn result_method(
+        &mut self,
+        stack: &mut Vec<Value>,
+        recv: Value,
+        method: &str,
+        _args: &[Value],
+    ) -> Result<bool, VmError> {
+        match (&recv, method) {
+            (Value::Ok(_), "is_ok") => {
+                stack.push(Value::Bool(true));
+                Ok(true)
+            }
+            (Value::Err(_), "is_ok") => {
+                stack.push(Value::Bool(false));
+                Ok(true)
+            }
+            (Value::Err(_), "is_err") => {
+                stack.push(Value::Bool(true));
+                Ok(true)
+            }
+            (Value::Ok(_), "is_err") => {
+                stack.push(Value::Bool(false));
+                Ok(true)
+            }
+            (Value::Ok(v), "unwrap") => {
+                stack.push((**v).clone());
+                Ok(true)
+            }
+            (Value::Err(v), "unwrap") => Err(err(Msg::UnwrapErr(v.display()), 0, 0)),
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "Result".into(),
+                    method: method.into(),
+                },
+                0,
+                0,
+            )),
+        }
     }
 
     fn list_method(
@@ -1314,6 +1804,10 @@ fn truthy(v: &Value) -> bool {
         Value::Float(f) => *f != 0.0,
         Value::Str(s) => !s.is_empty(),
         Value::List(items) => !items.borrow().is_empty(),
+        Value::Dict(items) => !items.borrow().is_empty(),
+        Value::Set(items) => !items.borrow().is_empty(),
+        Value::None => false,
+        Value::Some(_) | Value::Ok(_) | Value::Err(_) => true,
         Value::Struct(_) => true,
         _ => false,
     }

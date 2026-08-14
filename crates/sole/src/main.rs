@@ -4,6 +4,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut lang: Option<sole::Lang> = None;
     let mut path: Option<String> = None;
+    let mut cmd: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -27,7 +28,8 @@ fn main() -> ExitCode {
                 println!("sole {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
-            "run" => {
+            "run" | "test" => {
+                cmd = Some(args[i].clone());
                 i += 1;
             }
             other if other.starts_with('-') => {
@@ -56,12 +58,38 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            match sole::run_source(&source) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(msg) => {
-                    eprintln!("error: {}", msg);
-                    ExitCode::from(1)
-                }
+            match cmd.as_deref() {
+                Some("test") => match sole::run_tests(&source) {
+                    Ok(results) => {
+                        let mut failed = 0;
+                        for (name, outcome) in &results {
+                            match outcome {
+                                Ok(()) => println!("PASS {}", name),
+                                Err(e) => {
+                                    failed += 1;
+                                    println!("FAIL {}", name);
+                                    eprintln!("  error: {}", e);
+                                }
+                            }
+                        }
+                        if failed > 0 || results.is_empty() {
+                            ExitCode::from(1)
+                        } else {
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(msg) => {
+                        eprintln!("error: {}", msg);
+                        ExitCode::from(1)
+                    }
+                },
+                _ => match sole::run_source(&source) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(msg) => {
+                        eprintln!("error: {}", msg);
+                        ExitCode::from(1)
+                    }
+                },
             }
         }
         None => {
@@ -71,6 +99,7 @@ fn main() -> ExitCode {
             );
             eprintln!("usage:");
             eprintln!("  sole run [--lang en|zh] <file>    run a .sole script");
+            eprintln!("  sole test [--lang en|zh] <file>   run the `test` blocks");
             eprintln!("  sole --version                    print version");
             eprintln!("(error messages default to English; SOLE_LANG env var also works)");
             ExitCode::from(2)

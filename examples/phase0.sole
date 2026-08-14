@@ -1,0 +1,89 @@
+# M4 阶段 0 综合验证: Option/Result、泛型、Dict/Set/Tuple、str、test、assert
+fn max[T: Comparable](a: T, b: T) -> T:
+    if a > b:
+        return a
+    return b
+
+fn min[T: Comparable](a: T, b: T) -> T:
+    if a < b:
+        return a
+    return b
+
+fn first_or_zero(xs: List[int]) -> int:
+    if xs.len() > 0:
+        return xs[0]
+    return 0
+
+fn parse_int(s: str) -> Result[int, str]:
+    return s.to_int()
+
+let a: Option[int] = Some(42)
+let b: Option[int] = None
+print(a.is_some())
+print(a.unwrap())
+print(b.is_none())
+
+let r1: Result[int, str] = Ok(7)
+let r2: Result[int, str] = Err("boom")
+print(r1.is_ok())
+print(r1.unwrap())
+print(r2.is_err())
+
+print(max(3, 9))
+print(min(3, 9))
+print(max("apple", "banana"))
+
+let d: Dict[str, int] = {"x": 1, "y": 2}
+print(d.len())
+d.set("z", 3)
+print(d.get("x").unwrap())
+print(d.contains("z"))
+print(d.keys())
+d.remove("y")
+print(d.len())
+
+let e: Dict[str, int] = {}
+print(e.len())
+
+let s: Set[int] = {1, 2, 2, 3}
+print(s.len())
+print(s.contains(2))
+s.add(4)
+print(s.contains(4))
+s.remove(2)
+print(s.contains(2))
+
+let t = (1, "two", 3.0)
+print(t.len())
+print(t[0])
+print(t[1])
+
+let greeting = "hello, world"
+print(greeting.len())
+print(greeting.sub(0, 5))
+print(greeting.split(",").len())
+print("-".join(["a", "b", "c"]))
+print(greeting.contains("world"))
+print(greeting.starts_with("hello"))
+print(greeting.ends_with("world"))
+
+let n = parse_int("123")
+print(n.unwrap())
+let bad = parse_int("abc")
+print(bad.is_err())
+
+print(first_or_zero([5, 6]))
+print(first_or_zero([]))
+
+test option_works:
+    let o: Option[int] = Some(1)
+    assert o.is_some()
+    assert o.unwrap() == 1
+
+test dict_works:
+    let d2: Dict[str, int] = {"a": 1}
+    assert d2.len() == 1
+
+test set_works:
+    let s2: Set[int] = {}
+    assert s2.len() == 0

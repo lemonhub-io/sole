@@ -10,7 +10,7 @@
 use sole_diag::{Diagnostic, Lang, Msg};
 use sole_parser::{
     BinOp, Block, ElseBranch, Expr, FnDef, ImplDef, Item, MethodSig, Param, Program, Span, Stmt,
-    Type, UnOp,
+    Type, TypeParam, UnOp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -27,10 +27,16 @@ pub enum Ty {
     Unknown,
     List(Box<Ty>),
     Chan(Box<Ty>),
+    Option(Box<Ty>),
+    Result(Box<Ty>, Box<Ty>),
+    Dict(Box<Ty>, Box<Ty>),
+    Set(Box<Ty>),
+    Tuple(Vec<Ty>),
     Struct(String),
     Interface(String),
     Ref(Box<Ty>),
     MutRef(Box<Ty>),
+    TypeVar(String),
 }
 
 impl Ty {
@@ -56,6 +62,15 @@ impl Ty {
             Ty::Unknown => "?".into(),
             Ty::List(inner) => format!("List[{}]", inner.name()),
             Ty::Chan(inner) => format!("Chan[{}]", inner.name()),
+            Ty::Option(inner) => format!("Option[{}]", inner.name()),
+            Ty::Result(ok, err) => format!("Result[{}, {}]", ok.name(), err.name()),
+            Ty::Dict(k, v) => format!("Dict[{}, {}]", k.name(), v.name()),
+            Ty::Set(inner) => format!("Set[{}]", inner.name()),
+            Ty::Tuple(ts) => format!(
+                "({})",
+                ts.iter().map(Ty::name).collect::<Vec<_>>().join(", ")
+            ),
+            Ty::TypeVar(name) => name.clone(),
             Ty::Struct(name) => name.clone(),
             Ty::Interface(name) => name.clone(),
             Ty::Ref(inner) => format!("ref {}", inner.name()),
@@ -72,6 +87,7 @@ impl Ty {
                 | Ty::Str
                 | Ty::Ref(_)
                 | Ty::Chan(_)
+                | Ty::TypeVar(_)
                 | Ty::Fn
                 | Ty::Unknown
         )
@@ -80,7 +96,17 @@ impl Ty {
     fn is_truthy(&self) -> bool {
         matches!(
             self,
-            Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::List(_) | Ty::Unknown
+            Ty::Int
+                | Ty::Float
+                | Ty::Bool
+                | Ty::Str
+                | Ty::List(_)
+                | Ty::Dict(..)
+                | Ty::Set(_)
+                | Ty::Option(_)
+                | Ty::Result(..)
+                | Ty::TypeVar(_)
+                | Ty::Unknown
         )
     }
 
@@ -139,6 +165,7 @@ impl Var {
 #[derive(Debug, Clone)]
 struct FnSig {
     name: String,
+    type_params: Vec<(String, Option<String>)>,
     params: Vec<(String, Ty)>,
     ret: Ty,
 }
@@ -189,6 +216,7 @@ pub fn check(program: &Program) -> Result<(), TypeError> {
     checker.check_block(&Block { stmts: top_stmts })?;
     checker.vars.pop();
     checker.check_functions()?;
+    checker.check_tests()?;
     Ok(())
 }
 
@@ -196,7 +224,7 @@ impl<'a> Checker<'a> {
     fn collect_fns(&mut self) -> Result<(), TypeError> {
         for item in &self.program.items {
             if let Item::Fn(f) = item {
-                let sig = self.fn_sig(&f.name, &f.params, f.ret.as_ref(), None)?;
+                let sig = self.fn_sig(&f.name, &f.type_params, &f.params, f.ret.as_ref(), None)?;
                 self.fns.insert(f.name.clone(), sig);
             }
         }
@@ -206,24 +234,58 @@ impl<'a> Checker<'a> {
     fn fn_sig(
         &self,
         name: &str,
+        type_params: &[TypeParam],
         params: &[Param],
         ret: Option<&Type>,
         self_ty: Option<&Ty>,
     ) -> Result<FnSig, TypeError> {
+        let tps: Vec<(String, Option<String>)> = type_params
+            .iter()
+            .map(|p| (p.name.clone(), p.bound.clone()))
+            .collect();
         let mut sig_params = Vec::new();
         for p in params {
-            let ty = self.ty_of_type(&p.ty, self_ty)?;
+            let ty = self.ty_of_type_with(&p.ty, self_ty, &tps)?;
             sig_params.push((p.name.clone(), ty));
         }
         let ret = match ret {
-            Some(t) => self.ty_of_type(t, self_ty)?,
+            Some(t) => self.ty_of_type_with(t, self_ty, &tps)?,
             None => Ty::Unit,
         };
         Ok(FnSig {
             name: name.to_string(),
+            type_params: tps,
             params: sig_params,
             ret,
         })
+    }
+
+    /// Like `ty_of_type` but with a generic parameter list in scope: bare
+    /// identifiers naming a type parameter resolve to `Ty::TypeVar`.
+    fn ty_of_type_with(
+        &self,
+        t: &Type,
+        self_ty: Option<&Ty>,
+        type_params: &[(String, Option<String>)],
+    ) -> Result<Ty, TypeError> {
+        match t {
+            Type::Named(name, args) => {
+                if args.is_empty() && type_params.iter().any(|(n, _)| n == name) {
+                    return Ok(Ty::TypeVar(name.clone()));
+                }
+                self.ty_of_type(t, self_ty)
+            }
+            Type::Ref(inner) => Ok(Ty::Ref(Box::new(self.ty_of_type_with(
+                inner,
+                self_ty,
+                type_params,
+            )?))),
+            Type::MutRef(inner) => Ok(Ty::MutRef(Box::new(self.ty_of_type_with(
+                inner,
+                self_ty,
+                type_params,
+            )?))),
+        }
     }
 
     /// Resolves a parsed type to a `Ty`. `self_ty` substitutes `Self`.
@@ -231,6 +293,7 @@ impl<'a> Checker<'a> {
         match t {
             Type::Named(name, args) => {
                 if args.is_empty() {
+                    // Type variable (generic parameter) or plain type name.
                     match name.as_str() {
                         "int" => return Ok(Ty::Int),
                         "float" => return Ok(Ty::Float),
@@ -245,6 +308,48 @@ impl<'a> Checker<'a> {
                     }
                 }
                 match name.as_str() {
+                    "Option" => {
+                        if args.len() != 1 {
+                            return Err(err(
+                                Msg::ArgCount("Option".into(), 1, args.len()),
+                                Span::new(0, 0),
+                            ));
+                        }
+                        let inner = self.ty_of_type(&args[0], self_ty)?;
+                        Ok(Ty::Option(Box::new(inner)))
+                    }
+                    "Result" => {
+                        if args.len() != 2 {
+                            return Err(err(
+                                Msg::ArgCount("Result".into(), 2, args.len()),
+                                Span::new(0, 0),
+                            ));
+                        }
+                        let ok = self.ty_of_type(&args[0], self_ty)?;
+                        let err = self.ty_of_type(&args[1], self_ty)?;
+                        Ok(Ty::Result(Box::new(ok), Box::new(err)))
+                    }
+                    "Dict" => {
+                        if args.len() != 2 {
+                            return Err(err(
+                                Msg::ArgCount("Dict".into(), 2, args.len()),
+                                Span::new(0, 0),
+                            ));
+                        }
+                        let k = self.ty_of_type(&args[0], self_ty)?;
+                        let v = self.ty_of_type(&args[1], self_ty)?;
+                        Ok(Ty::Dict(Box::new(k), Box::new(v)))
+                    }
+                    "Set" => {
+                        if args.len() != 1 {
+                            return Err(err(
+                                Msg::ArgCount("Set".into(), 1, args.len()),
+                                Span::new(0, 0),
+                            ));
+                        }
+                        let inner = self.ty_of_type(&args[0], self_ty)?;
+                        Ok(Ty::Set(Box::new(inner)))
+                    }
                     "List" => {
                         if args.len() != 1 {
                             return Err(err(
@@ -370,7 +475,7 @@ impl<'a> Checker<'a> {
                 ));
             }
         }
-        self.fn_sig(&m.name, &m.params, m.ret.as_ref(), Some(&self_ty))
+        self.fn_sig(&m.name, &[], &m.params, m.ret.as_ref(), Some(&self_ty))
     }
 
     fn check_interfaces(&mut self) -> Result<(), TypeError> {
@@ -714,7 +819,29 @@ impl<'a> Checker<'a> {
                         return Ok(());
                     }
                 }
-                let actual = self.infer_expr_consume(value, *span)?;
+                let actual = match (ty, value) {
+                    // Empty collection literal under an annotation:
+                    // the element types come from the annotation.
+                    (Some(annot), Expr::List(items, _)) if items.is_empty() => {
+                        match self.ty_of_type(annot, None)? {
+                            Ty::List(inner) => Ty::List(inner),
+                            other => other,
+                        }
+                    }
+                    (Some(annot), Expr::Dict(pairs, _)) if pairs.is_empty() => {
+                        match self.ty_of_type(annot, None)? {
+                            Ty::Dict(k, v) => Ty::Dict(k, v),
+                            other => other,
+                        }
+                    }
+                    (Some(annot), Expr::Set(items, _)) if items.is_empty() => {
+                        match self.ty_of_type(annot, None)? {
+                            Ty::Set(inner) => Ty::Set(inner),
+                            other => other,
+                        }
+                    }
+                    _ => self.infer_expr_consume(value, *span)?,
+                };
                 match ty {
                     Some(annot) => {
                         let expected = self.ty_of_type(annot, None)?;
@@ -962,6 +1089,19 @@ impl<'a> Checker<'a> {
                 Ok(())
             }
             Stmt::Yield { .. } => Ok(()),
+            Stmt::Assert { expr, span } => {
+                let ty = self.infer_expr(expr)?;
+                if !matches!(ty.deref(), Ty::Bool | Ty::Unknown | Ty::TypeVar(_)) {
+                    return Err(err(
+                        Msg::OpTypeMismatch {
+                            op: "assert".into(),
+                            actual: ty.name(),
+                        },
+                        *span,
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1053,6 +1193,77 @@ impl<'a> Checker<'a> {
             Expr::Float(..) => Ok(Ty::Float),
             Expr::Str(..) => Ok(Ty::Str),
             Expr::Bool(..) => Ok(Ty::Bool),
+            Expr::Dict(pairs, span) => {
+                let mut key_ty: Option<Ty> = None;
+                let mut val_ty: Option<Ty> = None;
+                for (k, v) in pairs {
+                    let kt = self.infer_expr_consume(k, *span)?;
+                    let vt = self.infer_expr_consume(v, *span)?;
+                    match &key_ty {
+                        None => key_ty = Some(kt),
+                        Some(e) => {
+                            if !self.is_compatible(e, &kt) && !matches!(e, Ty::Unknown) {
+                                return Err(err(
+                                    Msg::DictKeyMismatch {
+                                        expected: e.name(),
+                                        actual: kt.name(),
+                                    },
+                                    *span,
+                                ));
+                            }
+                        }
+                    }
+                    match &val_ty {
+                        None => val_ty = Some(vt),
+                        Some(e) => {
+                            if !self.is_compatible(e, &vt) && !matches!(e, Ty::Unknown) {
+                                return Err(err(
+                                    Msg::ListElemMismatch {
+                                        expected: e.name(),
+                                        actual: vt.name(),
+                                    },
+                                    *span,
+                                ));
+                            }
+                        }
+                    }
+                }
+                match (key_ty, val_ty) {
+                    (Some(k), Some(v)) => Ok(Ty::Dict(Box::new(k), Box::new(v))),
+                    _ => Err(err(Msg::EmptyDictNoType, *span)),
+                }
+            }
+            Expr::Set(items, span) => {
+                let mut elem_ty: Option<Ty> = None;
+                for it in items {
+                    let t = self.infer_expr_consume(it, *span)?;
+                    match &elem_ty {
+                        None => elem_ty = Some(t),
+                        Some(e) => {
+                            if !self.is_compatible(e, &t) && !matches!(e, Ty::Unknown) {
+                                return Err(err(
+                                    Msg::SetElemMismatch {
+                                        expected: e.name(),
+                                        actual: t.name(),
+                                    },
+                                    *span,
+                                ));
+                            }
+                        }
+                    }
+                }
+                match elem_ty {
+                    Some(t) => Ok(Ty::Set(Box::new(t))),
+                    None => Err(err(Msg::EmptySetNoType, *span)),
+                }
+            }
+            Expr::Tuple(items, span) => {
+                let mut ts = Vec::with_capacity(items.len());
+                for it in items {
+                    ts.push(self.infer_expr_consume(it, *span)?);
+                }
+                Ok(Ty::Tuple(ts))
+            }
             Expr::List(items, span) => {
                 let mut elem_ty: Option<Ty> = None;
                 for it in items {
@@ -1078,6 +1289,9 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Ident(name, span) => {
+                if name == "None" {
+                    return Ok(Ty::Option(Box::new(Ty::Unknown)));
+                }
                 if skip == Some(name.as_str()) {
                     return self.read_var(name, *span);
                 }
@@ -1137,12 +1351,32 @@ impl<'a> Checker<'a> {
             Expr::Index { obj, index, span } => {
                 let obj_ty = self.infer_expr(obj)?;
                 let idx_ty = self.infer_expr(index)?;
-                if !matches!(idx_ty, Ty::Int | Ty::Unknown) {
-                    return Err(err(Msg::IndexNotInt, *span));
-                }
                 let base = obj_ty.deref();
                 match base {
-                    Ty::List(inner) => Ok(inner.as_ref().clone()),
+                    Ty::List(inner) => {
+                        if !matches!(idx_ty, Ty::Int | Ty::Unknown) {
+                            return Err(err(Msg::IndexNotInt, *span));
+                        }
+                        Ok(inner.as_ref().clone())
+                    }
+                    Ty::Tuple(ts) => {
+                        if !matches!(idx_ty, Ty::Int | Ty::Unknown) {
+                            return Err(err(Msg::IndexNotInt, *span));
+                        }
+                        Ok(ts.first().cloned().unwrap_or(Ty::Unknown))
+                    }
+                    Ty::Dict(k, v) => {
+                        if !types_compatible(k, &idx_ty) && !matches!(k.as_ref(), Ty::Unknown) {
+                            return Err(err(
+                                Msg::DictKeyMismatch {
+                                    expected: k.name(),
+                                    actual: idx_ty.name(),
+                                },
+                                *span,
+                            ));
+                        }
+                        Ok(v.as_ref().clone())
+                    }
                     Ty::Unknown => Ok(Ty::Unknown),
                     other => Err(err(Msg::IndexOnNonList(other.name()), *span)),
                 }
@@ -1197,6 +1431,7 @@ impl<'a> Checker<'a> {
                         Ok(Ty::Float)
                     }
                     (Ty::Str, Ty::Str) if op == Add => Ok(Ty::Str),
+                    (Ty::TypeVar(tv), _) | (_, Ty::TypeVar(tv)) => Ok(Ty::TypeVar(tv.clone())),
                     (Ty::Unknown, t) | (t, Ty::Unknown) => Ok((*t).clone()),
                     _ => Err(err(
                         Msg::OpTypeMismatch {
@@ -1218,6 +1453,8 @@ impl<'a> Checker<'a> {
                         | (Ty::Float, Ty::Int)
                         | (Ty::Str, Ty::Str)
                         | (Ty::Bool, Ty::Bool)
+                        | (Ty::TypeVar(_), _)
+                        | (_, Ty::TypeVar(_))
                         | (Ty::Unknown, _)
                         | (_, Ty::Unknown)
                 );
@@ -1274,6 +1511,33 @@ impl<'a> Checker<'a> {
         }
         if let Expr::Ident(name, _) = callee {
             match name.as_str() {
+                "Some" => {
+                    if args.len() != 1 {
+                        return Err(err(Msg::ArgCount("Some".into(), 1, args.len()), span));
+                    }
+                    let inner = self.infer_expr(args.first().unwrap())?;
+                    return Ok(Ty::Option(Box::new(inner)));
+                }
+                "None" => {
+                    if !args.is_empty() {
+                        return Err(err(Msg::ArgCount("None".into(), 0, args.len()), span));
+                    }
+                    return Ok(Ty::Option(Box::new(Ty::Unknown)));
+                }
+                "Ok" => {
+                    if args.len() != 1 {
+                        return Err(err(Msg::ArgCount("Ok".into(), 1, args.len()), span));
+                    }
+                    let inner = self.infer_expr(args.first().unwrap())?;
+                    return Ok(Ty::Result(Box::new(inner), Box::new(Ty::Unknown)));
+                }
+                "Err" => {
+                    if args.len() != 1 {
+                        return Err(err(Msg::ArgCount("Err".into(), 1, args.len()), span));
+                    }
+                    let inner = self.infer_expr(args.first().unwrap())?;
+                    return Ok(Ty::Result(Box::new(Ty::Unknown), Box::new(inner)));
+                }
                 "print" => {
                     for a in args {
                         self.infer_expr(a)?;
@@ -1339,15 +1603,75 @@ impl<'a> Checker<'a> {
     }
 
     fn check_fn_call(&mut self, sig: &FnSig, args: &[Expr], span: Span) -> Result<Ty, TypeError> {
-        if args.len() != sig.params.len() {
+        // Instantiate generic type variables from the argument types.
+        let mut bindings: HashMap<String, Ty> = HashMap::new();
+        if !sig.type_params.is_empty() {
+            if args.len() > sig.params.len() {
+                return Err(err(
+                    Msg::ArgCount(sig.name.clone(), sig.params.len(), args.len()),
+                    span,
+                ));
+            }
+            for (a, (_, pty)) in args.iter().zip(&sig.params) {
+                if let Ty::TypeVar(tv) = pty {
+                    let actual = self.infer_expr(a)?;
+                    match bindings.get(tv) {
+                        Some(prev) => {
+                            if !types_compatible(prev, &actual) {
+                                return Err(err(
+                                    Msg::ArgTypeMismatch {
+                                        func: sig.name.clone(),
+                                        index: 0,
+                                        expected: prev.name(),
+                                        actual: actual.name(),
+                                    },
+                                    span,
+                                ));
+                            }
+                        }
+                        None => {
+                            bindings.insert(tv.clone(), actual);
+                        }
+                    }
+                }
+            }
+            // Check constraints (e.g. `T: Comparable`).
+            for (tv, bound) in &sig.type_params {
+                if let Some(ty) = bindings.get(tv) {
+                    if let Some(b) = bound {
+                        if !self.satisfies_bound(ty, b) {
+                            return Err(err(
+                                Msg::GenericConstraint {
+                                    func: sig.name.clone(),
+                                    bound: b.clone(),
+                                    ty: ty.name(),
+                                },
+                                span,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        fn subst(t: &Ty, bindings: &HashMap<String, Ty>) -> Ty {
+            match t {
+                Ty::TypeVar(tv) => bindings.get(tv).cloned().unwrap_or_else(|| t.clone()),
+                Ty::Ref(inner) => Ty::Ref(Box::new(subst(inner, bindings))),
+                Ty::MutRef(inner) => Ty::MutRef(Box::new(subst(inner, bindings))),
+                other => other.clone(),
+            }
+        }
+        let expected_params = sig.params.clone();
+        if args.len() != expected_params.len() {
             return Err(err(
-                Msg::ArgCount(sig.name.clone(), sig.params.len(), args.len()),
+                Msg::ArgCount(sig.name.clone(), expected_params.len(), args.len()),
                 span,
             ));
         }
-        for (i, (a, (_, expected))) in args.iter().zip(&sig.params).enumerate() {
-            let (actual, borrowed) = self.infer_call_arg(a, expected, span)?;
-            if !borrowed && !types_compatible(expected, &actual) {
+        for (i, (a, (_, expected))) in args.iter().zip(&expected_params).enumerate() {
+            let expected = subst(expected, &bindings);
+            let (actual, borrowed) = self.infer_call_arg(a, &expected, span)?;
+            if !borrowed && !self.is_compatible(&expected, &actual) {
                 return Err(err(
                     Msg::ArgTypeMismatch {
                         func: sig.name.clone(),
@@ -1359,7 +1683,15 @@ impl<'a> Checker<'a> {
                 ));
             }
         }
-        Ok(sig.ret.clone())
+        Ok(subst(&sig.ret, &bindings))
+    }
+
+    fn satisfies_bound(&self, ty: &Ty, bound: &str) -> bool {
+        match bound {
+            // Comparable: supports `==` / ordering comparisons.
+            "Comparable" => matches!(ty.deref(), Ty::Int | Ty::Float | Ty::Bool | Ty::Str),
+            _ => false,
+        }
     }
 
     /// Checks one call argument against the expected type. Returns the
@@ -1412,7 +1744,23 @@ impl<'a> Checker<'a> {
                 Ok((t, true))
             }
             _ => {
-                let t = self.infer_expr_consume(arg, span)?;
+                // Empty collection literals get their element type from the
+                // expected parameter type (e.g. `[]` for `xs: List[int]`).
+                let t = match (arg, expected) {
+                    (Expr::List(items, _), Ty::List(inner)) if items.is_empty() => {
+                        Ty::List(inner.clone())
+                    }
+                    (Expr::Dict(pairs, _), Ty::Dict(k, v)) if pairs.is_empty() => {
+                        Ty::Dict(k.clone(), v.clone())
+                    }
+                    (Expr::Set(items, _), Ty::Set(inner)) if items.is_empty() => {
+                        Ty::Set(inner.clone())
+                    }
+                    (Expr::Tuple(items, _), Ty::Tuple(ts)) if items.is_empty() => {
+                        Ty::Tuple(ts.clone())
+                    }
+                    _ => self.infer_expr_consume(arg, span)?,
+                };
                 Ok((t, false))
             }
         }
@@ -1430,6 +1778,12 @@ impl<'a> Checker<'a> {
         match &base {
             Ty::List(inner) => self.infer_list_method(obj, inner, name, args, span),
             Ty::Chan(inner) => self.infer_chan_method(obj, inner, name, args, span),
+            Ty::Str => self.infer_str_method(obj, name, args, span),
+            Ty::Dict(k, v) => self.infer_dict_method(obj, k, v, name, args, span),
+            Ty::Set(inner) => self.infer_set_method(obj, inner, name, args, span),
+            Ty::Tuple(ts) => self.infer_tuple_method(obj, ts, name, args, span),
+            Ty::Option(inner) => self.infer_option_method(obj, inner, name, args, span),
+            Ty::Result(ok, _) => self.infer_result_method(obj, ok, name, args, span),
             Ty::Struct(sname) => {
                 if let Some(sig) = self
                     .methods
@@ -1471,6 +1825,7 @@ impl<'a> Checker<'a> {
                 self.borrow_var_transient(obj, false, span)?;
                 let sig = self.fn_sig(
                     &method.name,
+                    &[],
                     &method.params,
                     method.ret.as_ref(),
                     Some(&Ty::Interface(iname.clone())),
@@ -1483,9 +1838,371 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Ty::Unknown)
             }
-            other => Err(err(
+            other => {
+                if name == "to_str" && args.is_empty() {
+                    return Ok(Ty::Str);
+                }
+                Err(err(
+                    Msg::UnknownMethod {
+                        ty: other.name(),
+                        method: name.to_string(),
+                    },
+                    span,
+                ))
+            }
+        }
+    }
+
+    /// Checks a builtin `str` method call.
+    fn infer_str_method(
+        &mut self,
+        _obj: &Expr,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        let expect = |n: usize| -> Result<(), TypeError> {
+            if args.len() != n {
+                return Err(err(
+                    Msg::ArgCount(format!("str.{}", name), n, args.len()),
+                    span,
+                ));
+            }
+            Ok(())
+        };
+        match name {
+            "len" => {
+                expect(0)?;
+                Ok(Ty::Int)
+            }
+            "to_str" => {
+                expect(0)?;
+                Ok(Ty::Str)
+            }
+            "sub" => {
+                expect(2)?;
+                self.check_int_args(args, "str.sub")?;
+                Ok(Ty::Str)
+            }
+            "split" => {
+                expect(1)?;
+                self.check_str_arg(&args[0], "str.split")?;
+                Ok(Ty::List(Box::new(Ty::Str)))
+            }
+            "join" => {
+                expect(1)?;
+                let a = self.infer_expr(&args[0])?;
+                if !matches!(a.deref(), Ty::List(_) | Ty::Unknown) {
+                    return Err(err(
+                        Msg::ArgTypeMismatch {
+                            func: "str.join".into(),
+                            index: 0,
+                            expected: "List[str]".into(),
+                            actual: a.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok(Ty::Str)
+            }
+            "contains" | "starts_with" | "ends_with" => {
+                expect(1)?;
+                self.check_str_arg(&args[0], &format!("str.{}", name))?;
+                Ok(Ty::Bool)
+            }
+            "to_int" => {
+                expect(0)?;
+                Ok(Ty::Result(Box::new(Ty::Int), Box::new(Ty::Str)))
+            }
+            "to_float" => {
+                expect(0)?;
+                Ok(Ty::Result(Box::new(Ty::Float), Box::new(Ty::Str)))
+            }
+            _ => Err(err(
                 Msg::UnknownMethod {
-                    ty: other.name(),
+                    ty: "str".into(),
+                    method: name.to_string(),
+                },
+                span,
+            )),
+        }
+    }
+
+    fn check_int_args(&mut self, args: &[Expr], func: &str) -> Result<(), TypeError> {
+        for (i, a) in args.iter().enumerate() {
+            let t = self.infer_expr(a)?;
+            if !matches!(t.deref(), Ty::Int | Ty::Unknown | Ty::TypeVar(_)) {
+                return Err(err(
+                    Msg::ArgTypeMismatch {
+                        func: func.into(),
+                        index: i,
+                        expected: "int".into(),
+                        actual: t.name(),
+                    },
+                    Span::new(0, 0),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_str_arg(&mut self, a: &Expr, func: &str) -> Result<(), TypeError> {
+        let t = self.infer_expr(a)?;
+        if !matches!(t.deref(), Ty::Str | Ty::Unknown) {
+            return Err(err(
+                Msg::ArgTypeMismatch {
+                    func: func.into(),
+                    index: 0,
+                    expected: "str".into(),
+                    actual: t.name(),
+                },
+                Span::new(0, 0),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks a builtin `Dict[K, V]` method call.
+    fn infer_dict_method(
+        &mut self,
+        _obj: &Expr,
+        k: &Ty,
+        v: &Ty,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        let expect = |n: usize| -> Result<(), TypeError> {
+            if args.len() != n {
+                return Err(err(
+                    Msg::ArgCount(format!("Dict.{}", name), n, args.len()),
+                    span,
+                ));
+            }
+            Ok(())
+        };
+        match name {
+            "len" | "keys" | "values" => {
+                expect(0)?;
+                Ok(match name {
+                    "len" => Ty::Int,
+                    "keys" => Ty::List(Box::new(k.clone())),
+                    _ => Ty::List(Box::new(v.clone())),
+                })
+            }
+            "get" => {
+                expect(1)?;
+                let at = self.infer_expr(&args[0])?;
+                if !types_compatible(k, &at) && !matches!(k, Ty::Unknown) {
+                    return Err(err(
+                        Msg::DictKeyMismatch {
+                            expected: k.name(),
+                            actual: at.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok(Ty::Option(Box::new(v.clone())))
+            }
+            "contains" => {
+                expect(1)?;
+                let at = self.infer_expr(&args[0])?;
+                if !types_compatible(k, &at) && !matches!(k, Ty::Unknown) {
+                    return Err(err(
+                        Msg::DictKeyMismatch {
+                            expected: k.name(),
+                            actual: at.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok(Ty::Bool)
+            }
+            "set" | "remove" => {
+                expect(2 - (name == "remove") as usize)?;
+                let at = self.infer_expr(&args[0])?;
+                if !types_compatible(k, &at) && !matches!(k, Ty::Unknown) {
+                    return Err(err(
+                        Msg::DictKeyMismatch {
+                            expected: k.name(),
+                            actual: at.name(),
+                        },
+                        span,
+                    ));
+                }
+                if name == "set" {
+                    let vt = self.infer_expr(&args[1])?;
+                    if !types_compatible(v, &vt) && !matches!(v, Ty::Unknown) {
+                        return Err(err(
+                            Msg::ListElemMismatch {
+                                expected: v.name(),
+                                actual: vt.name(),
+                            },
+                            span,
+                        ));
+                    }
+                }
+                Ok(Ty::Unit)
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: k.name() + "->" + &v.name() + " dict",
+                    method: name.to_string(),
+                },
+                span,
+            )),
+        }
+    }
+
+    /// Checks a builtin `Set[T]` method call.
+    fn infer_set_method(
+        &mut self,
+        _obj: &Expr,
+        inner: &Ty,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        let expect = |n: usize| -> Result<(), TypeError> {
+            if args.len() != n {
+                return Err(err(
+                    Msg::ArgCount(format!("Set.{}", name), n, args.len()),
+                    span,
+                ));
+            }
+            Ok(())
+        };
+        match name {
+            "len" => {
+                expect(0)?;
+                Ok(Ty::Int)
+            }
+            "add" | "remove" => {
+                expect(1)?;
+                let at = self.infer_expr(&args[0])?;
+                if !types_compatible(inner, &at) && !matches!(inner, Ty::Unknown) {
+                    return Err(err(
+                        Msg::SetElemMismatch {
+                            expected: inner.name(),
+                            actual: at.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok(Ty::Unit)
+            }
+            "contains" => {
+                expect(1)?;
+                let at = self.infer_expr(&args[0])?;
+                if !types_compatible(inner, &at) && !matches!(inner, Ty::Unknown) {
+                    return Err(err(
+                        Msg::SetElemMismatch {
+                            expected: inner.name(),
+                            actual: at.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok(Ty::Bool)
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: format!("Set[{}]", inner.name()),
+                    method: name.to_string(),
+                },
+                span,
+            )),
+        }
+    }
+
+    /// Checks a builtin `Tuple` method call (currently only `len`).
+    fn infer_tuple_method(
+        &mut self,
+        _obj: &Expr,
+        _ts: &[Ty],
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        if name == "len" && args.is_empty() {
+            return Ok(Ty::Int);
+        }
+        Err(err(
+            Msg::UnknownMethod {
+                ty: "tuple".into(),
+                method: name.to_string(),
+            },
+            span,
+        ))
+    }
+
+    /// Checks a builtin `Option[T]` method call.
+    fn infer_option_method(
+        &mut self,
+        _obj: &Expr,
+        inner: &Ty,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        let expect = |n: usize| -> Result<(), TypeError> {
+            if args.len() != n {
+                return Err(err(
+                    Msg::ArgCount(format!("Option.{}", name), n, args.len()),
+                    span,
+                ));
+            }
+            Ok(())
+        };
+        match name {
+            "is_some" | "is_none" => {
+                expect(0)?;
+                Ok(Ty::Bool)
+            }
+            "unwrap" => {
+                expect(0)?;
+                Ok(inner.clone())
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: format!("Option[{}]", inner.name()),
+                    method: name.to_string(),
+                },
+                span,
+            )),
+        }
+    }
+
+    /// Checks a builtin `Result[T, E]` method call.
+    fn infer_result_method(
+        &mut self,
+        _obj: &Expr,
+        ok: &Ty,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        let expect = |n: usize| -> Result<(), TypeError> {
+            if args.len() != n {
+                return Err(err(
+                    Msg::ArgCount(format!("Result.{}", name), n, args.len()),
+                    span,
+                ));
+            }
+            Ok(())
+        };
+        match name {
+            "is_ok" | "is_err" => {
+                expect(0)?;
+                Ok(Ty::Bool)
+            }
+            "unwrap" => {
+                expect(0)?;
+                Ok(ok.clone())
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "Result".into(),
                     method: name.to_string(),
                 },
                 span,
@@ -1675,6 +2392,22 @@ impl<'a> Checker<'a> {
         Ok(())
     }
 
+    /// Checks `test` blocks as parameter-less bodies (no callable
+    /// registration: they run only under `sole test`).
+    fn check_tests(&mut self) -> Result<(), TypeError> {
+        for item in &self.program.items {
+            if let Item::Test(t) = item {
+                self.vars.push(HashMap::new());
+                self.current_fn = Some(format!("test:{}", t.name));
+                let result = self.check_block(&t.body);
+                self.current_fn = None;
+                self.vars.pop();
+                result?;
+            }
+        }
+        Ok(())
+    }
+
     fn check_impl_body(&mut self, imp: &ImplDef) -> Result<(), TypeError> {
         // Impl methods run with `self` bound as the struct type.
         let self_ty = Ty::Struct(imp.ty.clone());
@@ -1699,10 +2432,7 @@ impl<'a> Checker<'a> {
     /// Whether `actual` can be used where `expected` is declared.
     /// `Struct` implements `Interface` when an `impl T: I` exists.
     fn is_compatible(&self, expected: &Ty, actual: &Ty) -> bool {
-        if matches!(expected, Ty::Unknown) || matches!(actual, Ty::Unknown) {
-            return true;
-        }
-        if expected == actual {
+        if types_compatible(expected, actual) {
             return true;
         }
         match (expected, actual) {
@@ -1714,11 +2444,29 @@ impl<'a> Checker<'a> {
     }
 }
 
+/// Structural compatibility: equal shapes, with `Unknown` holes accepted at
+/// any depth (e.g. `Option[?]` matches `Option[int]`).
 fn types_compatible(expected: &Ty, actual: &Ty) -> bool {
     if matches!(expected, Ty::Unknown) || matches!(actual, Ty::Unknown) {
         return true;
     }
-    expected == actual
+    match (expected, actual) {
+        (Ty::List(a), Ty::List(b)) => types_compatible(a, b),
+        (Ty::Chan(a), Ty::Chan(b)) => types_compatible(a, b),
+        (Ty::Option(a), Ty::Option(b)) => types_compatible(a, b),
+        (Ty::Result(a1, b1), Ty::Result(a2, b2)) => {
+            types_compatible(a1, a2) && types_compatible(b1, b2)
+        }
+        (Ty::Dict(a1, b1), Ty::Dict(a2, b2)) => {
+            types_compatible(a1, a2) && types_compatible(b1, b2)
+        }
+        (Ty::Set(a), Ty::Set(b)) => types_compatible(a, b),
+        (Ty::Tuple(a), Ty::Tuple(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| types_compatible(x, y))
+        }
+        (Ty::Ref(a), Ty::Ref(b)) | (Ty::MutRef(a), Ty::MutRef(b)) => types_compatible(a, b),
+        _ => expected == actual,
+    }
 }
 
 /// Records the last statement index at which each variable is used (NLL).
@@ -1732,6 +2480,22 @@ fn collect_uses(stmt: &Stmt, uses: &mut HashMap<String, usize>, idx: usize) {
             }
             Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) => {}
             Expr::List(items, _) => {
+                for it in items {
+                    expr_uses(it, uses, idx);
+                }
+            }
+            Expr::Dict(pairs, _) => {
+                for (k, v) in pairs {
+                    expr_uses(k, uses, idx);
+                    expr_uses(v, uses, idx);
+                }
+            }
+            Expr::Set(items, _) => {
+                for it in items {
+                    expr_uses(it, uses, idx);
+                }
+            }
+            Expr::Tuple(items, _) => {
                 for it in items {
                     expr_uses(it, uses, idx);
                 }
@@ -1820,6 +2584,7 @@ fn collect_uses(stmt: &Stmt, uses: &mut HashMap<String, usize>, idx: usize) {
         Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Yield { .. } => {}
         Stmt::TaskGroup { body, .. } => block_uses(body, uses, idx),
         Stmt::Go { call, .. } => expr_uses(call, uses, idx),
+        Stmt::Assert { expr, .. } => expr_uses(expr, uses, idx),
     }
 }
 

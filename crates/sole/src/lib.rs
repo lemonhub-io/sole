@@ -21,6 +21,31 @@ pub fn run_source(source: &str) -> Result<(), String> {
     run_source_to(source, &mut std::io::stdout())
 }
 
+/// Outcome of a single `test` block.
+pub type TestOutcome = (String, Result<(), String>);
+
+/// Runs every `test` block in the source; returns (name, outcome) pairs.
+pub fn run_tests(source: &str) -> Result<Vec<TestOutcome>, String> {
+    let program = parse(source).map_err(|e| e.to_string())?;
+    typecheck::check(&program).map_err(|e| e.to_string())?;
+    let compiled = compiler::compile(&program).map_err(|e| e.to_string())?;
+    let test_fns: Vec<(String, usize)> = compiled
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name.starts_with("test:"))
+        .map(|(i, f)| (f.name[5..].to_string(), i))
+        .collect();
+    let mut results = Vec::new();
+    for (name, fi) in test_fns {
+        let mut sink = Vec::new();
+        let mut rt = vm::Runtime::new(Rc::new(compiled.clone()), &mut sink);
+        let outcome = rt.run_function(fi).map_err(|e| e.to_string());
+        results.push((name, outcome));
+    }
+    Ok(results)
+}
+
 /// Like `run_source` but writes output to the given writer.
 pub fn run_source_to(source: &str, out: &mut dyn std::io::Write) -> Result<(), String> {
     let program = parse(source).map_err(|e| e.to_string())?;
@@ -195,5 +220,156 @@ print(sign(0))
     fn buffered_channel_end_to_end() {
         let src = "fn worker(ch: Chan[int]) -> int:\n    ch.send(1)\n    ch.send(2)\n    ch.send(3)\n    return 0\ntask_group:\n    let ch = Chan[int](3)\n    go worker(ch)\n    print(ch.recv())\n    print(ch.recv())\n    print(ch.recv())\n";
         assert_eq!(run_with_output(src).unwrap(), "1\n2\n3\n");
+    }
+}
+
+#[cfg(test)]
+mod m4_tests {
+    use super::*;
+
+    fn run(src: &str) -> Result<String, String> {
+        let program = parse(src).map_err(|e| e.to_string())?;
+        typecheck::check(&program).map_err(|e| e.to_string())?;
+        let compiled = compiler::compile(&program).map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        let mut rt = vm::Runtime::new(Rc::new(compiled), &mut buf);
+        rt.run().map_err(|e| e.to_string())?;
+        String::from_utf8(buf).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn option_and_result_end_to_end() {
+        let src = r#"
+let a: Option[int] = Some(42)
+let b: Option[int] = None
+let r1: Result[int, str] = Ok(7)
+let r2: Result[int, str] = Err("boom")
+print(a.is_some())
+print(a.unwrap())
+print(b.is_none())
+print(r1.is_ok())
+print(r1.unwrap())
+print(r2.is_err())
+"#;
+        assert_eq!(run(src).unwrap(), "true\n42\ntrue\ntrue\n7\ntrue\n");
+    }
+
+    #[test]
+    fn unwrap_none_is_runtime_error() {
+        let err = run("let o: Option[int] = None\nprint(o.unwrap())\n").unwrap_err();
+        assert!(err.contains("[E0219]"), "err: {err}");
+    }
+
+    #[test]
+    fn generic_function_end_to_end() {
+        let src = r#"
+fn max[T: Comparable](a: T, b: T) -> T:
+    if a > b:
+        return a
+    return b
+print(max(3, 9))
+print(max("apple", "banana"))
+"#;
+        assert_eq!(run(src).unwrap(), "9\nbanana\n");
+    }
+
+    #[test]
+    fn generic_constraint_violation_is_error() {
+        let err =
+            run("fn f[T: Comparable](x: T) -> T:\n    return x\nlet xs = [1]\nprint(f(xs))\n")
+                .unwrap_err();
+        assert!(err.contains("[E0320]"), "err: {err}");
+    }
+
+    #[test]
+    fn dict_end_to_end() {
+        let src = r#"
+let d: Dict[str, int] = {"x": 1, "y": 2}
+d.set("z", 3)
+print(d.len())
+print(d.get("x").unwrap())
+print(d.contains("z"))
+print(d["y"])
+d.remove("x")
+print(d.contains("x"))
+let e: Dict[str, int] = {}
+print(e.len())
+"#;
+        assert_eq!(run(src).unwrap(), "3\n1\ntrue\n2\nfalse\n0\n");
+    }
+
+    #[test]
+    fn set_end_to_end() {
+        let src = r#"
+let s: Set[int] = {1, 2, 2, 3}
+print(s.len())
+print(s.contains(2))
+s.add(4)
+print(s.contains(4))
+s.remove(2)
+print(s.contains(2))
+"#;
+        assert_eq!(run(src).unwrap(), "3\ntrue\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn tuple_end_to_end() {
+        let src = "let t = (1, \"two\", 3.0)\nprint(t.len())\nprint(t[0])\nprint(t[1])\n";
+        assert_eq!(run(src).unwrap(), "3\n1\ntwo\n");
+    }
+
+    #[test]
+    fn str_methods_end_to_end() {
+        let src = r#"
+let s = "hello, world"
+print(s.len())
+print(s.sub(0, 5))
+print(s.split(",").len())
+print("-".join(["a", "b"]))
+print(s.contains("world"))
+print(s.starts_with("hello"))
+print(s.ends_with("world"))
+"#;
+        assert_eq!(run(src).unwrap(), "12\nhello\n2\na-b\ntrue\ntrue\ntrue\n");
+    }
+
+    #[test]
+    fn str_parse_returns_result() {
+        let src = r#"
+let n = "123".to_int()
+print(n.unwrap())
+let bad = "abc".to_int()
+print(bad.is_err())
+print("1.5".to_float().unwrap())
+"#;
+        assert_eq!(run(src).unwrap(), "123\ntrue\n1.5\n");
+    }
+
+    #[test]
+    fn assert_failure_is_runtime_error() {
+        let err = run("assert 1 == 2\n").unwrap_err();
+        assert!(err.contains("[E0221]"), "err: {err}");
+        assert!(run("assert 2 == 2\n").is_ok());
+    }
+
+    #[test]
+    fn test_blocks_do_not_run_on_normal_execution() {
+        let src = "test quiet:\n    print(\"boom\")\n";
+        assert_eq!(run(src).unwrap(), "");
+    }
+
+    #[test]
+    fn run_tests_runs_test_blocks() {
+        let src = "test ok:\n    assert 1 == 1\ntest bad:\n    assert 1 == 2\n";
+        let results = run_tests(src).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_ok());
+        assert!(results[1].1.is_err());
+    }
+
+    #[test]
+    fn to_str_method() {
+        let src = "print((42).to_str())\nprint(\"x\".to_str())\n";
+        assert_eq!(run(src).unwrap(), "42\nx\n");
     }
 }

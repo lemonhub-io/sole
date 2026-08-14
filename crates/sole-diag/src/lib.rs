@@ -96,6 +96,13 @@ pub enum Msg {
     CmpMismatch,
     InternalFnIndex,
     Io(String),
+    UnwrapNone,
+    UnwrapErr(String),
+    AssertFailed,
+    TupleIndexOutOfRange {
+        index: usize,
+        len: usize,
+    },
     // Type checker (E03xx)
     LetTypeMismatch {
         name: String,
@@ -147,6 +154,25 @@ pub enum Msg {
     EmptyListNoType,
     IndexOnNonList(String),
     IndexNotInt,
+    DictKeyMismatch {
+        expected: String,
+        actual: String,
+    },
+    SetElemMismatch {
+        expected: String,
+        actual: String,
+    },
+    EmptyDictNoType,
+    EmptySetNoType,
+    GenericConstraint {
+        func: String,
+        bound: String,
+        ty: String,
+    },
+    TypeVarOutOfScope {
+        name: String,
+        func: String,
+    },
     // Borrow checker (E04xx)
     UseAfterMove(String),
     MoveWhileBorrowed(String),
@@ -194,6 +220,10 @@ impl Msg {
             Msg::CmpMismatch => "E0216",
             Msg::InternalFnIndex => "E0217",
             Msg::Io(_) => "E0218",
+            Msg::UnwrapNone => "E0219",
+            Msg::UnwrapErr(_) => "E0220",
+            Msg::AssertFailed => "E0221",
+            Msg::TupleIndexOutOfRange { .. } => "E0222",
             Msg::LetTypeMismatch { .. } => "E0301",
             Msg::AssignTypeMismatch { .. } => "E0302",
             Msg::ArgTypeMismatch { .. } => "E0303",
@@ -209,6 +239,12 @@ impl Msg {
             Msg::EmptyListNoType => "E0313",
             Msg::IndexOnNonList(_) => "E0314",
             Msg::IndexNotInt => "E0315",
+            Msg::DictKeyMismatch { .. } => "E0316",
+            Msg::SetElemMismatch { .. } => "E0317",
+            Msg::EmptyDictNoType => "E0318",
+            Msg::EmptySetNoType => "E0319",
+            Msg::GenericConstraint { .. } => "E0320",
+            Msg::TypeVarOutOfScope { .. } => "E0321",
             Msg::UseAfterMove(_) => "E0401",
             Msg::MoveWhileBorrowed(_) => "E0402",
             Msg::MutBorrowConflict(_) => "E0403",
@@ -283,6 +319,38 @@ impl Msg {
             Msg::CmpMismatch => "comparison type mismatch".into(),
             Msg::InternalFnIndex => "internal error: invalid function index".into(),
             Msg::Io(e) => format!("I/O error: {}", e),
+            Msg::UnwrapNone => "called `unwrap()` on `None`".into(),
+            Msg::UnwrapErr(e) => format!("called `unwrap()` on `Err`: {}", e),
+            Msg::AssertFailed => "assertion failed".into(),
+            Msg::TupleIndexOutOfRange { index, len } => {
+                format!(
+                    "tuple index {} out of range (tuple has {} elements)",
+                    index, len
+                )
+            }
+            Msg::DictKeyMismatch { expected, actual } => format!(
+                "dict key type mismatch: expected `{}`, got `{}`",
+                expected, actual
+            ),
+            Msg::SetElemMismatch { expected, actual } => format!(
+                "set element type mismatch: expected `{}`, got `{}`",
+                expected, actual
+            ),
+            Msg::EmptyDictNoType => {
+                "empty dict literal needs a type annotation (e.g. `let d: Dict[str, int] = {}`)"
+                    .into()
+            }
+            Msg::EmptySetNoType => {
+                "empty set literal needs a type annotation (e.g. `let s: Set[int] = {}`)".into()
+            }
+            Msg::GenericConstraint { func, bound, ty } => format!(
+                "generic parameter of `{}` must satisfy `{}`, but `{}` does not",
+                func, bound, ty
+            ),
+            Msg::TypeVarOutOfScope { name, func } => format!(
+                "type variable `{}` used outside generic function `{}`",
+                name, func
+            ),
             Msg::LetTypeMismatch {
                 name,
                 expected,
@@ -420,6 +488,29 @@ impl Msg {
             Msg::CmpMismatch => "比较运算符类型不匹配".into(),
             Msg::InternalFnIndex => "内部错误: 函数索引无效".into(),
             Msg::Io(e) => format!("I/O 错误: {}", e),
+            Msg::UnwrapNone => "对 `None` 调用 `unwrap()`".into(),
+            Msg::UnwrapErr(e) => format!("对 `Err` 调用 `unwrap()`: {}", e),
+            Msg::AssertFailed => "断言失败".into(),
+            Msg::TupleIndexOutOfRange { index, len } => {
+                format!("元组索引 {} 越界(元组有 {} 个元素)", index, len)
+            }
+            Msg::DictKeyMismatch { expected, actual } => {
+                format!("字典键类型不匹配: 期望 `{}`,实际 `{}`", expected, actual)
+            }
+            Msg::SetElemMismatch { expected, actual } => {
+                format!("集合元素类型不匹配: 期望 `{}`,实际 `{}`", expected, actual)
+            }
+            Msg::EmptyDictNoType => {
+                "空字典字面量需要类型标注(如 `let d: Dict[str, int] = {}`)".into()
+            }
+            Msg::EmptySetNoType => "空集合字面量需要类型标注(如 `let s: Set[int] = {}`)".into(),
+            Msg::GenericConstraint { func, bound, ty } => format!(
+                "`{}` 的泛型参数必须满足 `{}`,但 `{}` 不满足",
+                func, bound, ty
+            ),
+            Msg::TypeVarOutOfScope { name, func } => {
+                format!("类型变量 `{}` 在泛型函数 `{}` 之外使用", name, func)
+            }
             Msg::LetTypeMismatch {
                 name,
                 expected,

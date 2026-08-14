@@ -4,7 +4,9 @@
 //! indices; globals to program-global indices. Calls with `ref`/`mut ref`
 //! parameters push the caller's cell (`PushVarCell`) so writes propagate.
 
-use sole_parser::{BinOp, Block, ElseBranch, Expr, FnDef, ImplDef, Item, Program, Stmt, UnOp};
+use sole_parser::{
+    BinOp, Block, ElseBranch, Expr, FnDef, ImplDef, Item, Program, Stmt, TestDef, UnOp,
+};
 use std::collections::HashMap;
 
 use crate::vm::{CompiledProgram, Function, Instr, Value};
@@ -68,6 +70,9 @@ pub fn compile(program: &Program) -> Result<CompiledProgram, String> {
         if let Item::Fn(f) = item {
             c.compile_fn(f)?;
         }
+        if let Item::Test(t) = item {
+            c.compile_test(t)?;
+        }
         if let Item::Impl(imp) = item {
             c.compile_impl(imp)?;
         }
@@ -96,6 +101,14 @@ impl<'a> Compiler<'a> {
                         name: f.name.clone(),
                         nparams: f.params.len() as u32,
                         nlocals: f.params.len() as u32,
+                        code: vec![Instr::Halt],
+                    });
+                }
+                Item::Test(t) => {
+                    self.functions.push(Function {
+                        name: format!("test:{}", t.name),
+                        nparams: 0,
+                        nlocals: 0,
                         code: vec![Instr::Halt],
                     });
                 }
@@ -141,6 +154,21 @@ impl<'a> Compiler<'a> {
         code.push(Instr::Halt);
         self.functions[0].code = code;
         self.functions[0].nlocals = ctx.next_local;
+        Ok(())
+    }
+
+    fn compile_test(&mut self, t: &TestDef) -> Result<(), String> {
+        let name = format!("test:{}", t.name);
+        let idx = self.fn_index(&name);
+        let mut code = Vec::new();
+        let mut ctx = FuncCtx {
+            locals: HashMap::new(),
+            next_local: 0,
+        };
+        self.compile_block(&t.body, &mut code, &mut ctx)?;
+        code.push(Instr::RetUnit);
+        self.functions[idx].code = code;
+        self.functions[idx].nlocals = ctx.next_local;
         Ok(())
     }
 
@@ -340,6 +368,10 @@ impl<'a> Compiler<'a> {
             Stmt::Yield { .. } => {
                 code.push(Instr::Yield);
             }
+            Stmt::Assert { expr, .. } => {
+                self.compile_expr(expr, code, ctx)?;
+                code.push(Instr::Assert);
+            }
         }
         Ok(())
     }
@@ -364,9 +396,32 @@ impl<'a> Compiler<'a> {
                 }
                 code.push(Instr::MakeList(items.len() as u32));
             }
+            Expr::Dict(pairs, _) => {
+                for (k, v) in pairs {
+                    self.compile_expr(k, code, ctx)?;
+                    self.compile_expr(v, code, ctx)?;
+                }
+                code.push(Instr::MakeDict(pairs.len() as u32));
+            }
+            Expr::Set(items, _) => {
+                for it in items {
+                    self.compile_expr(it, code, ctx)?;
+                }
+                code.push(Instr::MakeSet(items.len() as u32));
+            }
+            Expr::Tuple(items, _) => {
+                for it in items {
+                    self.compile_expr(it, code, ctx)?;
+                }
+                code.push(Instr::MakeTuple(items.len() as u32));
+            }
             Expr::Ident(name, _) => {
-                let slot = ctx.slot(name);
-                code.push(Instr::PushVar(slot));
+                if name == "None" {
+                    code.push(Instr::PushNone);
+                } else {
+                    let slot = ctx.slot(name);
+                    code.push(Instr::PushVar(slot));
+                }
             }
             Expr::Unary { op, expr, .. } => {
                 self.compile_expr(expr, code, ctx)?;
@@ -435,6 +490,31 @@ impl<'a> Compiler<'a> {
                 // Function call.
                 let fn_idx = match callee.as_ref() {
                     Expr::Ident(name, _) => match name.as_str() {
+                        "Some" => {
+                            for a in args {
+                                self.compile_expr(a, code, ctx)?;
+                            }
+                            code.push(Instr::PushSome);
+                            return Ok(());
+                        }
+                        "None" => {
+                            code.push(Instr::PushNone);
+                            return Ok(());
+                        }
+                        "Ok" => {
+                            for a in args {
+                                self.compile_expr(a, code, ctx)?;
+                            }
+                            code.push(Instr::PushOk);
+                            return Ok(());
+                        }
+                        "Err" => {
+                            for a in args {
+                                self.compile_expr(a, code, ctx)?;
+                            }
+                            code.push(Instr::PushErr);
+                            return Ok(());
+                        }
                         "print" => {
                             for a in args {
                                 self.compile_expr(a, code, ctx)?;
@@ -546,6 +626,36 @@ impl Value {
                     .join(", ")
             ),
             Value::Chan(_) => "<chan>".into(),
+            Value::None => "None".into(),
+            Value::Some(v) => format!("Some({})", v.display()),
+            Value::Ok(v) => format!("Ok({})", v.display()),
+            Value::Err(v) => format!("Err({})", v.display()),
+            Value::Dict(pairs) => format!(
+                "{{{}}}",
+                pairs
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k.display(), v.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Value::Set(items) => format!(
+                "{{{}}}",
+                items
+                    .borrow()
+                    .iter()
+                    .map(Value::display)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Value::Tuple(items) => format!(
+                "({})",
+                items
+                    .iter()
+                    .map(Value::display)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Value::Ref(cell) | Value::MutRef(cell) => cell.borrow().display(),
             Value::Fn(i) => format!("<fn {}>", i),
             Value::Unit => String::new(),
