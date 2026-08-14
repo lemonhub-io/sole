@@ -106,7 +106,7 @@ pub enum Instr {
     GetField(u32),
     SetField(u32),
     Call(u32),
-    CallMethod(u32),
+    CallMethod(u32, u32),
     BuiltinPrint(u32),
     BuiltinRange,
     Return,
@@ -191,15 +191,17 @@ fn err(msg: Msg, line: usize, column: usize) -> VmError {
     }
 }
 
-/// A stack frame: function index, return address, local values.
+/// A stack frame: function index, return address, and the stack index where
+/// this frame's locals live. Locals live directly on the task stack, so
+/// calls are zero-copy: the caller's args become the callee's first locals.
 ///
-/// Locals are plain values; a slot only gets an `Rc<RefCell>` cell when it is
-/// actually borrowed (`ref`/`mut ref`) or passed by cell (`PushVarCell`), so
-/// the common case never allocates per local.
+/// A slot only gets an `Rc<RefCell>` cell when it is actually borrowed
+/// (`ref`/`mut ref`) or passed by cell (`PushVarCell`), so the common case
+/// never allocates per local.
 pub struct Frame {
     pub func: usize,
     pub ret: usize,
-    pub locals: Vec<Value>,
+    pub base: usize,
     pub cells: Vec<Option<Rc<RefCell<Value>>>>,
 }
 #[derive(Default)]
@@ -319,18 +321,18 @@ impl<'a> Runtime<'a> {
     /// Creates a new task running function `func` with `args`.
     fn spawn(&mut self, func: usize, args: Vec<Value>, group: usize) -> usize {
         let f = &self.prog.functions[func];
-        let mut locals = args;
-        locals.resize(f.nlocals as usize, Value::Unit);
-        let cells = Vec::new();
+        let nlocals = f.nlocals as usize;
+        let mut stack = args;
+        stack.resize(nlocals.max(stack.len()), Value::Unit);
         let id = self.tasks.len();
         self.tasks.push(Some(Box::new(Task {
             ip: 0,
-            stack: Vec::new(),
+            stack,
             frames: vec![Frame {
                 func,
                 ret: 0,
-                locals,
-                cells,
+                base: 0,
+                cells: Vec::new(),
             }],
             group,
             done: false,
@@ -411,21 +413,29 @@ impl<'a> Runtime<'a> {
         // `yield`). The dispatch loop stays hot; the scheduler and the
         // per-run prologue are amortized over many instructions.
         let mut budget = 100_000_000usize;
+        let mut func = task.frames.last().unwrap().func;
+        let mut code = &prog.functions[func].code;
         loop {
             budget -= 1;
             if budget == 0 {
                 return Err(err(Msg::InternalFnIndex, 0, 0));
             }
+            // Refresh the cached code slice only when the frame's function
+            // changed (Call/Return); the common path skips the functions
+            // table lookup entirely.
             let Some(frame) = task.frames.last() else {
                 task.done = true;
                 break;
             };
-            let func = &prog.functions[frame.func];
-            if task.ip >= func.code.len() {
+            if frame.func != func {
+                func = frame.func;
+                code = &prog.functions[func].code;
+            }
+            if task.ip >= code.len() {
                 task.done = true;
                 break;
             }
-            let instr = &func.code[task.ip];
+            let instr = &code[task.ip];
             task.ip += 1;
             match instr {
                 Instr::Halt => {
@@ -452,7 +462,7 @@ impl<'a> Runtime<'a> {
                         let frame = task.frames.last().unwrap();
                         match frame.cells.get(*i as usize).and_then(|c| c.clone()) {
                             Some(cell) => cell.borrow().clone(),
-                            None => frame.locals[*i as usize].clone(),
+                            None => task.stack[frame.base + *i as usize].clone(),
                         }
                     };
                     task.stack.push(v);
@@ -471,7 +481,8 @@ impl<'a> Runtime<'a> {
                             }
                             None => {
                                 // First cell use: materialize the slot's cell.
-                                match frame.locals[*i as usize].clone() {
+                                let idx = frame.base + *i as usize;
+                                match task.stack[idx].clone() {
                                     Value::Ref(inner) | Value::MutRef(inner) => Value::Ref(inner),
                                     cur => {
                                         let cell = Rc::new(RefCell::new(cur));
@@ -495,13 +506,13 @@ impl<'a> Runtime<'a> {
                 }
                 Instr::StoreVar(i) => {
                     let v = task.stack.pop().unwrap_or(Value::Unit);
-                    let cell = task
-                        .frames
-                        .last()
-                        .unwrap()
-                        .cells
-                        .get(*i as usize)
-                        .and_then(|c| c.clone());
+                    let (base, cell) = {
+                        let frame = task.frames.last().unwrap();
+                        (
+                            frame.base,
+                            frame.cells.get(*i as usize).and_then(|c| c.clone()),
+                        )
+                    };
                     if let Some(cell) = cell {
                         let cur = cell.borrow().clone();
                         match cur {
@@ -516,7 +527,7 @@ impl<'a> Runtime<'a> {
                             }
                         }
                     } else {
-                        let slot = &mut task.frames.last_mut().unwrap().locals[*i as usize];
+                        let slot = &mut task.stack[base + *i as usize];
                         match slot {
                             Value::MutRef(target) => {
                                 *target.borrow_mut() = v;
@@ -541,7 +552,8 @@ impl<'a> Runtime<'a> {
                         match frame.cells.get(*i as usize).and_then(|c| c.clone()) {
                             Some(cell) => cell,
                             None => {
-                                let cell = Rc::new(RefCell::new(frame.locals[*i as usize].clone()));
+                                let idx = frame.base + *i as usize;
+                                let cell = Rc::new(RefCell::new(task.stack[idx].clone()));
                                 let frame = task.frames.last_mut().unwrap();
                                 if frame.cells.len() <= *i as usize {
                                     frame.cells.resize(*i as usize + 1, None);
@@ -712,64 +724,36 @@ impl<'a> Runtime<'a> {
                 }
                 Instr::Call(fi) => {
                     let f = &prog.functions[*fi as usize];
-                    let mut args = Vec::with_capacity(f.nparams as usize);
-                    for _ in 0..f.nparams {
-                        args.push(task.stack.pop().unwrap_or(Value::Unit));
-                    }
-                    args.reverse();
-                    let mut locals = args;
-                    locals.resize(f.nlocals as usize, Value::Unit);
+                    // Zero-copy call: the args already on the stack become the
+                    // callee's first locals; only extra locals are pushed.
+                    let nparams = f.nparams as usize;
+                    let base = task.stack.len().saturating_sub(nparams);
+                    task.stack.resize(base + f.nlocals as usize, Value::Unit);
                     let ret = task.ip;
                     task.frames.push(Frame {
                         func: *fi as usize,
                         ret,
-                        locals,
+                        base,
                         cells: Vec::new(),
                     });
                     task.ip = 0;
                 }
-                Instr::CallMethod(m) => {
+                Instr::CallMethod(m, argc) => {
                     let method = prog.strings[*m as usize].clone();
                     // Find the method implementation by runtime struct type.
-                    // Stack layout: [receiver, arg1, ..., argN].
-                    let recv = task.stack.first().cloned().unwrap_or(Value::Unit);
+                    // Stack layout: [..locals.., receiver, arg1, ..., argN].
+                    // The receiver sits at `len - argc`; the compiler encodes
+                    // the total argument count (receiver included).
+                    let argc = *argc as usize;
+                    let recv = task.stack[task.stack.len().saturating_sub(argc)].clone();
                     let ty = match recv.deref() {
                         Value::Struct(sv) => sv.name.clone(),
                         Value::List(_) => {
-                            let argc = match method.as_ref() {
-                                "len" => 1,
-                                "push" | "get" => 2,
-                                "set" => 3,
-                                _ => {
-                                    return Err(err(
-                                        Msg::UnknownMethod {
-                                            ty: "List".into(),
-                                            method: method.to_string(),
-                                        },
-                                        0,
-                                        0,
-                                    ))
-                                }
-                            };
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
                             return self.list_method(&mut task.stack, recv, &method, &args[1..]);
                         }
                         Value::Chan(_) => {
-                            let argc = match method.as_ref() {
-                                "send" => 2,
-                                "recv" | "close" => 1,
-                                _ => {
-                                    return Err(err(
-                                        Msg::UnknownMethod {
-                                            ty: "Chan".into(),
-                                            method: method.to_string(),
-                                        },
-                                        0,
-                                        0,
-                                    ))
-                                }
-                            };
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
                             let blocked =
@@ -811,19 +795,13 @@ impl<'a> Runtime<'a> {
                         ));
                     };
                     let f = &prog.functions[fi];
-                    let argc = f.nparams as usize;
-                    let mut args = Vec::with_capacity(argc);
-                    for _ in 0..argc {
-                        args.push(task.stack.pop().unwrap_or(Value::Unit));
-                    }
-                    args.reverse();
-                    let mut locals = args;
-                    locals.resize(f.nlocals as usize, Value::Unit);
+                    let base = task.stack.len().saturating_sub(argc);
+                    task.stack.resize(base + f.nlocals as usize, Value::Unit);
                     let ret = task.ip;
                     task.frames.push(Frame {
                         func: fi,
                         ret,
-                        locals,
+                        base,
                         cells: Vec::new(),
                     });
                     task.ip = 0;
@@ -854,13 +832,15 @@ impl<'a> Runtime<'a> {
                 Instr::Return => {
                     let v = task.stack.pop().unwrap_or(Value::Unit);
                     let done = task.frames.len() == 1;
-                    let ret = task.frames.pop().map(|f| f.ret).unwrap_or(0);
+                    let (ret, base) = task.frames.pop().map(|f| (f.ret, f.base)).unwrap_or((0, 0));
+                    // Discard the callee's locals region, leaving the result.
+                    task.stack.truncate(base);
+                    task.stack.push(v);
                     if !done {
                         task.ip = ret;
                     } else {
                         task.done = true;
                     }
-                    task.stack.push(v);
                 }
                 Instr::Jump(target) => {
                     task.ip = *target as usize;
@@ -1133,13 +1113,15 @@ impl<'a> Runtime<'a> {
                 }
                 Instr::RetUnit => {
                     let done = task.frames.len() == 1;
-                    let ret = task.frames.pop().map(|f| f.ret).unwrap_or(0);
+                    let (ret, base) = task.frames.pop().map(|f| (f.ret, f.base)).unwrap_or((0, 0));
+                    // Discard the callee's locals region, leaving the unit value.
+                    task.stack.truncate(base);
+                    task.stack.push(Value::Unit);
                     if !done {
                         task.ip = ret;
                     } else {
                         task.done = true;
                     }
-                    task.stack.push(Value::Unit);
                 }
             }
         }

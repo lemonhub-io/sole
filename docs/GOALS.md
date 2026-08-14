@@ -354,7 +354,7 @@
 |------|------|------|
 | M1 ✅ | 词法 + 解析 + 树遍历解释器 | hello world、斐波那契、简单类型检查(2026-08-11 完成: 新增 E03xx 类型检查错误码、AST Span 定位) |
 | M2 ✅ | 静态类型检查器(完整,**含移动语义与最小借用规则**) | 类型/借用错误可定位报错(2026-08-11 完成: List[T]/struct/interface/impl、移动语义与借用流分析、E04xx 借用错误码) |
-| M3 ✅ | 字节码 VM(含**协程调度器与通道运行时**;编译到 C/LLVM 按需后期加入,补全借用检查) | 性能 ≥ CPython 同量级(2026-08-14 完成: AST→字节码 compiler + stack VM;`go`/`task_group`/`Chan[T]` 协程运行时;基准 fib+sum_loop 全程序 ~1.5x CPython,sum_loop 单独反超 ~1.5x;详见 bench/README) |
+| M3 ✅ | 字节码 VM(含**协程调度器与通道运行时**;编译到 C/LLVM 按需后期加入,补全借用检查) | 性能 ≥ CPython 同量级(2026-08-14 完成: AST→字节码 compiler + stack VM;`go`/`task_group`/`Chan[T]` 协程运行时;零拷贝调用 + 引用分派 + run-until-block 调度后,基准 fib+sum_loop 全程序 ~1.0x CPython,fib/sum_loop 单独均反超;详见 bench/README) |
 | M4 | 标准库核心 + formatter + LSP | 能完成一个真实小项目 |
 | M5 | AI 基准测试工具链 | 达到 §10.1 指标 |
 
@@ -393,4 +393,4 @@
 | 2026-08-11 | **M1 完成**: 新增 `sole-parser` AST 全节点 `Span`(行列)定位;新增 `sole` crate `typecheck` 模块(M1 简单静态类型检查: 标注/赋值/函数签名/运算符/迭代,错误码 E03xx 段);`run_source` 管线改为 lex → parse → typecheck → eval;求值错误带位置 | 对齐 M1 验收"简单类型检查"与 GOALS §9.2 错误定位要求 |
 | 2026-08-11 | 移除"iSH 内存受限、本地不运行 rustc、编译测试由 GitHub Actions 承担"的表述: 开发环境资源充足,编译/格式化/lint/测试恢复本地执行(README 与 §10.3 同步) | 开发环境变更,旧表述不再适用 |
 | 2026-08-11 | **M2 完成**: 类型系统扩展(List[T]/Struct/Interface/Ref/MutRef,含接口子类型兼容);新增 `struct`/`interface`/`impl` 语法与方法调用(含 `self` 借用);移动语义与借用检查(use-after-move/借用期间移动/可变借用冲突/借用逃逸,错误码 E04xx 段);eval 改造为 `Rc<RefCell>` 单元实现引用共享;List 字面量/索引/内置方法;字段赋值 `obj.field = v` | 对齐 M2 验收"静态类型检查器(完整,含移动语义与最小借用规则)";借用为最小规则集,字段级借用与借用传播已支持,索引借用与细粒度留 M3 |
-| 2026-08-14 | **M3 完成**: eval 迁移到字节码 VM(新增 `compiler.rs` AST→字节码、`vm.rs` stack VM);协程调度器与通道运行时(`go`/`task_group`/`Chan[T]` send/recv/close、缓冲/无缓冲、`for v in ch`、`yield`);性能优化: locals 值语义 + 惰性借用 cell、`Value` 缩至 24B(Str 用 `Rc<str>`、Struct 装箱)、`&Instr` 引用分派 + int 算术快路径、run-until-block 协作调度(与 §7.3"仅在通道操作与 yield 处切换"对齐);新增 `bench/` 对比 CPython | 对齐 M3 验收"性能 ≥ CPython 同量级": fib(28)+sum_loop(1e6) 全程序约 1.5x CPython(原 3.7-4.4x),sum_loop 单独反超约 1.5x;详细数据见 bench/README |
+| 2026-08-14 | **M3 完成**: eval 迁移到字节码 VM(新增 `compiler.rs` AST→字节码、`vm.rs` stack VM);协程调度器与通道运行时(`go`/`task_group`/`Chan[T]` send/recv/close、缓冲/无缓冲、`for v in ch`、`yield`);性能优化: locals 值语义 + 惰性借用 cell、`Value` 缩至 24B(Str 用 `Rc<str>`、Struct 装箱)、`&Instr` 引用分派 + int 算术快路径、run-until-block 协作调度(与 §7.3"仅在通道操作与 yield 处切换"对齐)、零拷贝调用(局部变量直接放任务栈,Frame 改 base 索引)、当前函数 code 缓存、`CallMethod(m, argc)` 编码参数个数;新增 `bench/` 对比 CPython | 对齐 M3 验收"性能 ≥ CPython 同量级": fib(28)+sum_loop(1e6) 全程序 ~1.0x CPython(初版 3.7-4.4x),fib/sum_loop 单独均反超;详细数据见 bench/README |

@@ -401,7 +401,7 @@ impl<'a> Compiler<'a> {
                         self.compile_expr(a, code, ctx)?;
                     }
                     let m = self.intern_string(name);
-                    code.push(Instr::CallMethod(m));
+                    code.push(Instr::CallMethod(m, args.len() as u32 + 1));
                     return Ok(());
                 }
                 // Channel construction: `Chan[int]()` / `Chan[int](10)`.
@@ -443,6 +443,11 @@ impl<'a> Compiler<'a> {
                             return Ok(());
                         }
                         "range" => {
+                            // `range(n)` = `range(0, n)`: push the default
+                            // start so BuiltinRange always pops two values.
+                            if args.len() == 1 {
+                                code.push(Instr::PushInt(0));
+                            }
                             for a in args {
                                 self.compile_expr(a, code, ctx)?;
                             }
