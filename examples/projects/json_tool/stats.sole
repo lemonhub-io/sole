@@ -1,0 +1,237 @@
+fn is_scalar_num(s: str) -> bool:
+    if s == "true" or s == "false" or s == "None":
+        return false
+    if s.starts_with("{") or s.starts_with("["):
+        return false
+    if s.starts_with("\""):
+        return false
+    let parsed = s.to_float()
+    return parsed.is_ok()
+
+fn sum_into(v: Json) -> float:
+    let s = v.to_str()
+    if s.starts_with("{"):
+        let mut total = 0.0
+        for k in v.keys():
+            total = total + sum_into(v[k])
+        return total
+    if s.starts_with("["):
+        let mut total = 0.0
+        let mut i = 0
+        while i < v.len():
+            total = total + sum_into(v[i])
+            i = i + 1
+        return total
+    if is_scalar_num(s):
+        return s.to_float().unwrap()
+    return 0.0
+
+fn count_into(v: Json) -> int:
+    let s = v.to_str()
+    if s.starts_with("{"):
+        let mut total = 0
+        for k in v.keys():
+            total = total + count_into(v[k])
+        return total
+    if s.starts_with("["):
+        let mut total = 0
+        let mut i = 0
+        while i < v.len():
+            total = total + count_into(v[i])
+            i = i + 1
+        return total
+    if is_scalar_num(s):
+        return 1
+    return 0
+
+fn min_into(v: Json, best: float) -> float:
+    let s = v.to_str()
+    if s.starts_with("{"):
+        let mut b = best
+        for k in v.keys():
+            b = min_into(v[k], b)
+        return b
+    if s.starts_with("["):
+        let mut b = best
+        let mut i = 0
+        while i < v.len():
+            b = min_into(v[i], b)
+            i = i + 1
+        return b
+    if is_scalar_num(s):
+        let f = s.to_float().unwrap()
+        if f < best:
+            return f
+    return best
+
+fn max_into(v: Json, best: float) -> float:
+    let s = v.to_str()
+    if s.starts_with("{"):
+        let mut b = best
+        for k in v.keys():
+            b = max_into(v[k], b)
+        return b
+    if s.starts_with("["):
+        let mut b = best
+        let mut i = 0
+        while i < v.len():
+            b = max_into(v[i], b)
+            i = i + 1
+        return b
+    if is_scalar_num(s):
+        let f = s.to_float().unwrap()
+        if f > best:
+            return f
+    return best
+
+fn sum_values(root: Json) -> Result[float, str]:
+    return Ok(sum_into(root))
+
+fn avg_values(root: Json) -> Result[float, str]:
+    let n = count_into(root)
+    if n == 0:
+        return Err("no numbers found")
+    return Ok(sum_into(root) / n)
+
+fn min_values(root: Json) -> Result[float, str]:
+    let s = root.to_str()
+    if count_into(root) == 0:
+        return Err("no numbers found")
+    if is_scalar_num(s):
+        return Ok(s.to_float().unwrap())
+    return Ok(min_into(root, 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0))
+
+fn max_values(root: Json) -> Result[float, str]:
+    if count_into(root) == 0:
+        return Err("no numbers found")
+    return Ok(max_into(root, -1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0))
+
+fn count_numbers(root: Json) -> int:
+    return count_into(root)
+
+fn count_keys_total(root: Json) -> int:
+    let s = root.to_str()
+    if s.starts_with("{"):
+        let mut count = root.len()
+        for k in root.keys():
+            count = count + count_keys_total(root[k.to_str()])
+        return count
+    if s.starts_with("["):
+        let mut count = 0
+        let mut i = 0
+        while i < root.len():
+            count = count + count_keys_total(root[i])
+            i = i + 1
+        return count
+    return 0
+
+fn type_distribution(root: Json) -> Dict[str, int]:
+    let mut dist: Dict[str, int] = {}
+    collect_tags(root, dist)
+    return dist
+
+fn collect_tags(v: Json, dist: mut ref Dict[str, int]):
+    let tag = tag_of(v)
+    if dist.contains(tag):
+        dist.set(tag, dist[tag] + 1)
+    else:
+        dist.set(tag, 1)
+    let s = v.to_str()
+    if s.starts_with("{"):
+        for k in v.keys():
+            collect_tags(v[k], dist)
+    else if s.starts_with("["):
+        let mut i = 0
+        while i < v.len():
+            collect_tags(v[i], dist)
+            i = i + 1
+
+fn tag_of(v: Json) -> str:
+    let s = v.to_str()
+    if s.starts_with("{"):
+        return "object"
+    if s.starts_with("["):
+        return "array"
+    if s == "true" or s == "false":
+        return "bool"
+    if s == "None":
+        return "null"
+    if s.starts_with("\""):
+        return "string"
+    let f = s.to_float()
+    if f.is_ok():
+        return "number"
+    return "string"
+
+fn depth_of(v: Json) -> int:
+    let s = v.to_str()
+    if s.starts_with("{"):
+        let mut max_depth = 0
+        for k in v.keys():
+            let d = depth_of(v[k])
+            if d > max_depth:
+                max_depth = d
+        return max_depth + 1
+    if s.starts_with("["):
+        let mut max_depth = 0
+        let mut i = 0
+        while i < v.len():
+            let d = depth_of(v[i])
+            if d > max_depth:
+                max_depth = d
+            i = i + 1
+        return max_depth + 1
+    return 0
+
+test sum_flat_array:
+    let doc = json_decode("[1, 2, 3, 4]").unwrap()
+    assert sum_values(doc).unwrap() == 10.0
+
+test sum_nested:
+    let doc = json_decode("{\"a\": [1, 2], \"b\": {\"c\": 3.5}}").unwrap()
+    assert sum_values(doc).unwrap() == 6.5
+
+test avg_values_works:
+    let doc = json_decode("[2, 4, 6]").unwrap()
+    assert avg_values(doc).unwrap() == 4.0
+
+test avg_no_numbers:
+    let doc = json_decode("{\"a\": \"x\"}").unwrap()
+    assert avg_values(doc).is_err()
+
+test min_max_values:
+    let doc = json_decode("[5, 1, 9, -2]").unwrap()
+    assert min_values(doc).unwrap() == -2.0
+    assert max_values(doc).unwrap() == 9.0
+
+test count_numbers_works:
+    let doc = json_decode("[1, \"two\", 3.0, true]").unwrap()
+    assert count_numbers(doc) == 2
+
+test count_keys_total_counts:
+    let doc = json_decode("{\"a\": {\"b\": 1, \"c\": 2}, \"d\": 3}").unwrap()
+    assert count_keys_total(doc) == 4
+
+test depth_of_nested:
+    let doc = json_decode("{\"a\": {\"b\": {\"c\": 1}}}").unwrap()
+    assert depth_of(doc) == 3
+
+test depth_of_scalar:
+    assert depth_of(5) == 0
+
+test tag_of_kinds:
+    assert tag_of(json_decode("{}").unwrap()) == "object"
+    assert tag_of(json_decode("[]").unwrap()) == "array"
+    assert tag_of(json_decode("true").unwrap()) == "bool"
+    assert tag_of(json_decode("null").unwrap()) == "null"
+    assert tag_of(json_decode("42").unwrap()) == "number"
+    assert tag_of(json_decode("\"hi\"").unwrap()) == "string"
+
+test type_distribution_counts:
+    let doc = json_decode("{\"a\": 1, \"b\": \"x\", \"c\": [1], \"d\": true}").unwrap()
+    let dist = type_distribution(doc)
+    assert dist["object"] == 1
+    assert dist["array"] == 1
+    assert dist["number"] == 2
+    assert dist["string"] == 1
+    assert dist["bool"] == 1

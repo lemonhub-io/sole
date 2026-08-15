@@ -1,0 +1,27 @@
+fn worker(ch: Chan[int], n: int) -> int:
+    for i in range(n):
+        ch.send(i * i)
+    ch.close()
+    return 0
+
+fn sum_chan(ch: Chan[int]) -> int:
+    let mut total = 0
+    for v in ch:
+        total = total + v
+    return total
+
+task_group:
+    let ch = Chan[int](4)
+    go worker(ch, 10)
+    print(sum_chan(ch))
+
+fn ping_pong(ch: Chan[str], n: int) -> int:
+    for i in range(n):
+        ch.send("ping")
+    return 0
+
+task_group:
+    let ch2 = Chan[str](1)
+    go ping_pong(ch2, 3)
+    for i in range(3):
+        print(ch2.recv())

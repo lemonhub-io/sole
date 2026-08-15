@@ -1,0 +1,189 @@
+import path
+
+fn rest_of(parts: List[Json]) -> List[Json]:
+    let mut rest: List[Json] = []
+    let mut i = 1
+    while i < parts.len():
+        rest.push(parts[i])
+        i = i + 1
+    return rest
+
+fn set_value(root: Json, parts: List[Json], value: Json) -> Result[Json, str]:
+    if parts.len() == 0:
+        return Ok(value)
+    let head = parts[0]
+    if head.is_int():
+        let idx = head.to_str().to_int().unwrap()
+        if root.len() == 0 or idx >= root.len():
+            return Err("index out of range: " + head.to_str())
+        let rest = rest_of(parts)
+        let updated = set_value(root[idx], rest, value)
+        if updated.is_ok():
+            let val = updated.unwrap()
+            let mut arr: List[Json] = []
+            let mut j = 0
+            while j < root.len():
+                if j == idx:
+                    arr.push(val)
+                else:
+                    arr.push(root[j])
+                j = j + 1
+            return Ok(arr)
+        return Err("nested update failed")
+    let key = head.to_str()
+    let child = root[key]
+    let rest = rest_of(parts)
+    let updated = set_value(child, rest, value)
+    if updated.is_ok():
+        let val = updated.unwrap()
+        let mut result: Dict[str, Json] = {}
+        let keys = root.keys()
+        for k in keys:
+            let ks = k.to_str()
+            if ks == key:
+                result.set(ks, val)
+            else:
+                result.set(ks, root[ks])
+        return Ok(result)
+    return Err("nested update failed")
+
+fn delete_value(root: Json, parts: List[Json]) -> Result[Json, str]:
+    if parts.len() == 0:
+        return Err("cannot delete the root")
+    let head = parts[0]
+    let rest = rest_of(parts)
+    if head.is_int():
+        let idx = head.to_str().to_int().unwrap()
+        if idx >= root.len():
+            return Err("index out of range: " + head.to_str())
+        if rest.len() > 0:
+            let child = delete_value(root[idx], rest)
+            if child.is_ok():
+                let val = child.unwrap()
+                let mut arr: List[Json] = []
+                let mut j = 0
+                while j < root.len():
+                    if j == idx:
+                        arr.push(val)
+                    else:
+                        arr.push(root[j])
+                    j = j + 1
+                return Ok(arr)
+            return Err("nested delete failed")
+        let mut arr: List[Json] = []
+        let mut j = 0
+        while j < root.len():
+            if j != idx:
+                arr.push(root[j])
+            j = j + 1
+        return Ok(arr)
+    let key = head.to_str()
+    if rest.len() > 0:
+        let child = delete_value(root[key], rest)
+        if child.is_ok():
+            let val = child.unwrap()
+            let mut result: Dict[str, Json] = {}
+            let keys = root.keys()
+            for k in keys:
+                let ks = k.to_str()
+                if ks == key:
+                    result.set(ks, val)
+                else:
+                    result.set(ks, root[ks])
+            return Ok(result)
+        return Err("nested delete failed")
+    let mut result: Dict[str, Json] = {}
+    let keys = root.keys()
+    for k in keys:
+        let ks = k.to_str()
+        if ks != key:
+            result.set(ks, root[ks])
+    return Ok(result)
+
+fn merge_dicts(a: Dict[str, Json], b: Dict[str, Json]) -> Dict[str, Json]:
+    let mut out: Dict[str, Json] = {}
+    let ka = a.keys()
+    for k in ka:
+        let ks = k.to_str()
+        out.set(ks, a[ks])
+    let kb = b.keys()
+    for k in kb:
+        let ks = k.to_str()
+        if out.contains(ks):
+            let va = out[ks]
+            let vb = b[ks]
+            if is_container(va) and is_container(vb):
+                out.set(ks, merge_recursive(va, vb))
+            else:
+                out.set(ks, vb)
+        else:
+            out.set(ks, b[ks])
+    return out
+
+fn is_container(v: Json) -> bool:
+    let s = v.to_str()
+    return s.starts_with("{") or s.starts_with("[")
+
+fn merge_recursive(a: Json, b: Json) -> Json:
+    if is_container(a) and is_container(b):
+        return merge_dicts(a, b)
+    return b
+
+fn merge_json(a: Json, b: Json) -> Result[Json, str]:
+    if not is_container(a) and not is_container(b):
+        return Err("cannot merge scalars")
+    return Ok(merge_recursive(a, b))
+
+test set_updates_nested_value:
+    let doc = json_decode("{\"a\": {\"b\": 1}}").unwrap()
+    let parts = path.parse_path("a.b").unwrap()
+    let out = set_value(doc, parts, 42).unwrap()
+    assert out["a"]["b"] == 42
+
+test set_replaces_root:
+    let doc = json_decode("{\"a\": 1}").unwrap()
+    let out = set_value(doc, [], "x").unwrap()
+    assert out == "x"
+
+test set_array_index:
+    let doc = json_decode("[1, 2, 3]").unwrap()
+    let parts = path.parse_path("[1]").unwrap()
+    let out = set_value(doc, parts, 99).unwrap()
+    assert out[1] == 99
+
+test set_out_of_range:
+    let doc = json_decode("[1]").unwrap()
+    let parts = path.parse_path("[5]").unwrap()
+    assert set_value(doc, parts, 0).is_err()
+
+test delete_key:
+    let doc = json_decode("{\"a\": 1, \"b\": 2}").unwrap()
+    let parts = path.parse_path("a").unwrap()
+    let out = delete_value(doc, parts).unwrap()
+    assert out.contains("b")
+    assert not out.contains("a")
+
+test delete_array_element:
+    let doc = json_decode("[1, 2, 3]").unwrap()
+    let parts = path.parse_path("[1]").unwrap()
+    let out = delete_value(doc, parts).unwrap()
+    assert out.len() == 2
+    assert out[1] == 3
+
+test delete_root_is_error:
+    assert delete_value(json_decode("{}").unwrap(), []).is_err()
+
+test merge_dicts_combines:
+    let a = json_decode("{\"x\": 1, \"shared\": {\"k\": 1}}").unwrap()
+    let b = json_decode("{\"y\": 2, \"shared\": {\"j\": 2}}").unwrap()
+    let m = merge_json(a, b).unwrap()
+    assert m["x"] == 1
+    assert m["y"] == 2
+    assert m["shared"]["k"] == 1
+    assert m["shared"]["j"] == 2
+
+test merge_overwrites_scalars:
+    let a = json_decode("{\"x\": 1}").unwrap()
+    let b = json_decode("{\"x\": 2}").unwrap()
+    let m = merge_json(a, b).unwrap()
+    assert m["x"] == 2

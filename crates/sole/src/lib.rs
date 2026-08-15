@@ -478,6 +478,21 @@ print(r2.is_err())
     }
 
     #[test]
+    fn negative_literal_in_call_args() {
+        // `-x` compiles to `0 - x` and must push exactly one value; a
+        // stray push used to shift the argument slots (regression).
+        let src = r#"
+fn f(a: Json, b: float) -> float:
+    return b
+let doc = json_decode("[5, 1, 9, -2]").unwrap()
+print(f(doc, -5.0))
+print(f(-1e300, doc))
+print(-3 + 4)
+"#;
+        assert_eq!(run(src).unwrap(), "-5\n[5, 1, 9, -2]\n1\n");
+    }
+
+    #[test]
     fn generic_function_end_to_end() {
         let src = r#"
 fn max[T: Comparable](a: T, b: T) -> T:
@@ -816,13 +831,26 @@ mod fmt_tests {
         }
     }
 
+    fn fmt_sole_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                fmt_sole_files(&path, files);
+            } else if path.extension().is_some_and(|e| e == "sole") {
+                files.push(path);
+            }
+        }
+    }
+
     #[test]
     fn fmt_all_examples_is_idempotent() {
-        for entry in std::fs::read_dir(examples_dir()).unwrap().flatten() {
-            let src = std::fs::read_to_string(entry.path()).unwrap();
+        let mut files = Vec::new();
+        fmt_sole_files(&examples_dir(), &mut files);
+        for path in files {
+            let src = std::fs::read_to_string(&path).unwrap();
             let once = fmt(&src);
             let twice = fmt(&once);
-            assert_eq!(once, twice, "{} not idempotent", entry.path().display());
+            assert_eq!(once, twice, "{} not idempotent", path.display());
         }
     }
 }

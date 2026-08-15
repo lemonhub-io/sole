@@ -425,7 +425,7 @@
 | M1 ✅ | 词法 + 解析 + 树遍历解释器 | hello world、斐波那契、简单类型检查(2026-08-11 完成: 新增 E03xx 类型检查错误码、AST Span 定位) |
 | M2 ✅ | 静态类型检查器(完整,**含移动语义与最小借用规则**) | 类型/借用错误可定位报错(2026-08-11 完成: List[T]/struct/interface/impl、移动语义与借用流分析、E04xx 借用错误码) |
 | M3 ✅ | 字节码 VM(含**协程调度器与通道运行时**;编译到 C/LLVM 按需后期加入,补全借用检查) | 性能 ≥ CPython 同量级(2026-08-14 完成: AST→字节码 compiler + stack VM;`go`/`task_group`/`Chan[T]` 协程运行时;零拷贝调用 + 引用分派 + run-until-block 调度后,基准 fib+sum_loop 全程序 ~1.0x CPython,fib/sum_loop 单独均反超;详见 bench/README) |
-| M4 | 标准库核心 + formatter + LSP | 能完成一个真实小项目 |
+| M4 ✅ | 标准库核心 + formatter + LSP | 能完成一个真实小项目(2026-08-15 完成: 见变更记录;验收项目 `examples/projects/json_tool`) |
 | M5 | AI 基准测试工具链 | 达到 §10.1 指标 |
 
 **实现语言与构建**: 全部里程碑用 **Rust** 实现(自 M1 起)。
@@ -463,21 +463,36 @@
 | 2026-08-11 | **M1 完成**: 新增 `sole-parser` AST 全节点 `Span`(行列)定位;新增 `sole` crate `typecheck` 模块(M1 简单静态类型检查: 标注/赋值/函数签名/运算符/迭代,错误码 E03xx 段);`run_source` 管线改为 lex → parse → typecheck → eval;求值错误带位置 | 对齐 M1 验收"简单类型检查"与 GOALS §9.2 错误定位要求 |
 | 2026-08-11 | 移除"iSH 内存受限、本地不运行 rustc、编译测试由 GitHub Actions 承担"的表述: 开发环境资源充足,编译/格式化/lint/测试恢复本地执行(README 与 §10.3 同步) | 开发环境变更,旧表述不再适用 |
 | 2026-08-11 | **M2 完成**: 类型系统扩展(List[T]/Struct/Interface/Ref/MutRef,含接口子类型兼容);新增 `struct`/`interface`/`impl` 语法与方法调用(含 `self` 借用);移动语义与借用检查(use-after-move/借用期间移动/可变借用冲突/借用逃逸,错误码 E04xx 段);eval 改造为 `Rc<RefCell>` 单元实现引用共享;List 字面量/索引/内置方法;字段赋值 `obj.field = v` | 对齐 M2 验收"静态类型检查器(完整,含移动语义与最小借用规则)";借用为最小规则集,字段级借用与借用传播已支持,索引借用与细粒度留 M3 |
-| 2026-08-14 | **M4 阶段 2-3(formatter + LSP)**: 定 D14 并实现——formatter
-    (幂等 + 语义保持,全示例验证)与 `sole fmt`/`--check`(CI 接入);
-    LSP server(initialize/shutdown、full-sync 诊断复用 typechecker 双语渲染、
-    跳转定义、补全,6 个进程级集成测试) | 工具链: 官方格式与编辑支持可用,
-    AI 可依赖的确定性格式与即时诊断 | 定 D13 并实现——`import`/`from`
+| 2026-08-14 | **M4 阶段 0(语言地基)**: 定 D8-D12 并实现——`Option[T]`/`Result[T,E]`
+    构造与解包(Some/None/Ok/Err、is_some/is_none/is_ok/is_err/unwrap,错误码 E0219/E0220);
+    泛型函数与 `Comparable` 约束(E0320)、调用点实例化;
+    `Dict[K,V]`(索引/方法,get 返回 Option)、`Set[T]`(元素唯一)、`Tuple`(索引);
+    str 方法集(len/sub/split/join/contains/starts_with/ends_with/to_str/to_int/to_float);
+    `test` 块 + `sole test` 运行器 + `assert` 语句(E0221);
+    结构化兼容 `Unknown` 洞(Option[?] ~ Option[int]) | M4 地基: 错误处理/泛型/集合/str/测试原语,全部有测试覆盖 |
+| 2026-08-14 | **M4 阶段 1(标准库核心)**: 定 D13 并实现——`import`/`from`
     模块机制(多文件加载、循环去重、前缀重写、from 名称校验);
     标准库内建函数: 文件 IO(read_to_str/write)、时间(clock/sleep)、
     数学(abs/floor/ceil/round/sqrt/pow)、JSON(json_encode/json_decode +
     Json 动态类型);`None` 在集合字面量中作"洞"支持异构 JSON 字面量 |
     模块化 + 标准库核心全链路可用,单测覆盖;HTTP/Shared/Mutex 按 D13 后置 |
-| 2026-08-14 | **M4 阶段 1(标准库核心)**: 定 D8-D12 并实现——`Option[T]`/`Result[T,E]`
-   构造与解包(Some/None/Ok/Err、is_some/is_none/is_ok/is_err/unwrap,错误码 E0219/E0220);
-   泛型函数与 `Comparable` 约束(E0320)、调用点实例化;
-   `Dict[K,V]`(索引/方法,get 返回 Option)、`Set[T]`(元素唯一)、`Tuple`(索引);
-   str 方法集(len/sub/split/join/contains/starts_with/ends_with/to_str/to_int/to_float);
-   `test` 块 + `sole test` 运行器 + `assert` 语句(E0221);
-   结构化兼容 `Unknown` 洞(Option[?] ~ Option[int]) | M4 地基: 错误处理/泛型/集合/str/测试原语,全部有测试覆盖 |
+| 2026-08-14 | **M4 阶段 2-3(formatter + LSP)**: 定 D14 并实现——formatter
+    (幂等 + 语义保持,全示例验证)与 `sole fmt`/`--check`(CI 接入);
+    LSP server(initialize/shutdown、full-sync 诊断复用 typechecker 双语渲染、
+    跳转定义、补全,6 个进程级集成测试) | 工具链: 官方格式与编辑支持可用,
+    AI 可依赖的确定性格式与即时诊断 |
+| 2026-08-15 | **M4 完成(收尾)**: `and`/`or`/`not` 布尔运算符落实;
+    补充方法——str `trim`、List `contains`、Result `unwrap_err`、
+    Json `len`/`contains`/`keys`/`is_int`/`is_str`/`to_str`;
+    泛型函数调用点实例化重写(substitute_typevars/collect_bindings);
+    词法器支持科学计数法 float 字面量(`1e300`/`1.5e-3`/`2E+10`,`1e` 回退为 int+标识符);
+    **if 分支合并**: 发散分支(必然 return)内的 move 不影响分支后的状态,
+    非发散分支的 move 照常传播(E0401 保持);借用仍在分支内消亡;
+    修复已提交代码的 `-x` 编译 bug(多余 push 导致调用参数错位,`f(a, -b)` 实参被顶乱);
+    示例库扩充(collections/concurrency/generics/json_usage/option/str_methods);
+    验收项目 `examples/projects/json_tool`(JSON 命令行工具: 多文件模块 +
+    标准库 + 41 个 test 用例全绿)。诚实记录: CLI 暂不支持向脚本传参,
+    演示通过 test 块驱动 `main`;`x = f(x)` 自赋值在调用实参中仍不被
+    借用检查器接受(skip 机制未穿透调用,绕用临时变量/`mut ref` 累计) |
+    M4 验收"能完成一个真实小项目"落地;`sole run` 传参能力与自赋值留待 M5 |
 | 2026-08-14 | **M3 完成**: eval 迁移到字节码 VM(新增 `compiler.rs` AST→字节码、`vm.rs` stack VM);协程调度器与通道运行时(`go`/`task_group`/`Chan[T]` send/recv/close、缓冲/无缓冲、`for v in ch`、`yield`);性能优化: locals 值语义 + 惰性借用 cell、`Value` 缩至 24B(Str 用 `Rc<str>`、Struct 装箱)、`&Instr` 引用分派 + int 算术快路径、run-until-block 协作调度(与 §7.3"仅在通道操作与 yield 处切换"对齐)、零拷贝调用(局部变量直接放任务栈,Frame 改 base 索引)、当前函数 code 缓存、`CallMethod(m, argc)` 编码参数个数;新增 `bench/` 对比 CPython | 对齐 M3 验收"性能 ≥ CPython 同量级": fib(28)+sum_loop(1e6) 全程序 ~1.0x CPython(初版 3.7-4.4x),fib/sum_loop 单独均反超;详细数据见 bench/README |

@@ -1,0 +1,101 @@
+fn usage() -> str:
+    return "usage: json_tool get <file> <path> | keys <file> | len <file> <path> | pretty <file>"
+
+fn read_doc(file: str) -> Result[Json, str]:
+    let raw = read_to_str(file)
+    if raw.is_err():
+        return Err("cannot read " + file + ": " + raw.unwrap_err())
+    let doc = json_decode(raw.unwrap())
+    if doc.is_err():
+        return Err("invalid JSON in " + file + ": " + doc.unwrap_err())
+    return Ok(doc.unwrap())
+
+fn print_keys(doc: Json, prefix: str) -> int:
+    if doc.len() == 0:
+        return 0
+    let mut count = 0
+    for key in doc.keys():
+        print(prefix + key.to_str())
+        count = count + 1
+    return count
+
+fn pretty_json(doc: Json, indent: str) -> str:
+    let pad = indent + "  "
+    let s = doc.to_str()
+    if s.starts_with("{"):
+        let body = s.sub(1, s.len() - 1)
+        let mut out = "{"
+        let parts = body.split(",")
+        let n = parts.len()
+        let mut i = 0
+        while i < n:
+            let part = parts[i]
+            out = out + "\n" + pad + part.trim()
+            if i < n - 1:
+                out = out + ","
+            i = i + 1
+        out = out + "\n" + indent + "}"
+        return out
+    if s.starts_with("["):
+        let body = s.sub(1, s.len() - 1)
+        let mut out = "["
+        let parts = body.split(",")
+        let n = parts.len()
+        let mut i = 0
+        while i < n:
+            let part = parts[i]
+            out = out + "\n" + pad + part.trim()
+            if i < n - 1:
+                out = out + ","
+            i = i + 1
+        out = out + "\n" + indent + "]"
+        return out
+    return s
+
+fn count_leaf_keys(doc: Json) -> int:
+    let s = doc.to_str()
+    if s.starts_with("{") or s.starts_with("["):
+        let mut count = 0
+        let body = s.sub(1, s.len() - 1)
+        let parts = body.split(",")
+        for part in parts:
+            let inner = part.trim()
+            if inner.starts_with("\""):
+                count = count + 1
+            else:
+                count = count + 1
+        return count
+    return 1
+
+test usage_has_commands:
+    let u = usage()
+    assert u.contains("get")
+    assert u.contains("keys")
+    assert u.contains("pretty")
+
+test pretty_formats_object:
+    let doc = json_decode("{\"a\": 1, \"b\": 2}").unwrap()
+    let p = pretty_json(doc, "")
+    assert p.starts_with("{")
+    assert p.contains("a")
+    assert p.contains("b")
+
+test pretty_formats_array:
+    let doc = json_decode("[1, 2, 3]").unwrap()
+    let p = pretty_json(doc, "")
+    assert p.starts_with("[")
+    assert p.contains("3")
+
+test count_leaf_keys_counts:
+    let doc = json_decode("{\"a\": {\"b\": 1}, \"c\": [1, 2]}").unwrap()
+    assert count_leaf_keys(doc) >= 2
+
+test read_doc_missing_file:
+    assert read_doc("/nonexistent/file.json").is_err()
+
+test read_doc_bad_json:
+    let tmp = "examples/projects/json_tool/bad.json"
+    let w = write(tmp, "not json")
+    assert w.is_ok()
+    assert read_doc(tmp).is_err()
+    let _ = write(tmp, "")

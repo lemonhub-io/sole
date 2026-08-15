@@ -788,6 +788,16 @@ impl<'a> Runtime<'a> {
                         task.stack.push(Value::Str(Rc::from(recv.display())));
                         continue;
                     }
+                    if method.as_ref() == "is_int" && argc == 1 {
+                        let recv = task.stack.pop().unwrap_or(Value::Unit).deref();
+                        task.stack.push(Value::Bool(matches!(recv, Value::Int(_))));
+                        continue;
+                    }
+                    if method.as_ref() == "is_str" && argc == 1 {
+                        let recv = task.stack.pop().unwrap_or(Value::Unit).deref();
+                        task.stack.push(Value::Bool(matches!(recv, Value::Str(_))));
+                        continue;
+                    }
                     let ty = match recv.deref() {
                         Value::Struct(sv) => sv.name.clone(),
                         Value::Str(_) => {
@@ -1179,6 +1189,8 @@ impl<'a> Runtime<'a> {
                             }
                             Value::Int(a % b)
                         }
+                        (BinOp::And, _, _) => Value::Bool(truthy(&l) && truthy(&r)),
+                        (BinOp::Or, _, _) => Value::Bool(truthy(&l) || truthy(&r)),
                         _ => binary(*op, &l, &r).map_err(|m| err(m, 0, 0))?,
                     };
                     task.stack.push(v);
@@ -1346,6 +1358,10 @@ impl<'a> Runtime<'a> {
                     return Err(err(Msg::BadCall("ends_with needs a str".into()), 0, 0));
                 };
                 stack.push(Value::Bool(s.ends_with(sub.as_ref())));
+                Ok(true)
+            }
+            "trim" => {
+                stack.push(Value::Str(Rc::from(s.trim())));
                 Ok(true)
             }
             "to_int" => match s.parse::<i64>() {
@@ -1612,6 +1628,11 @@ impl<'a> Runtime<'a> {
                 Ok(true)
             }
             (Value::Err(v), "unwrap") => Err(err(Msg::UnwrapErr(v.display()), 0, 0)),
+            (Value::Err(v), "unwrap_err") => {
+                stack.push((**v).clone());
+                Ok(true)
+            }
+            (Value::Ok(_), "unwrap_err") => Err(err(Msg::BadCall("unwrap_err on Ok".into()), 0, 0)),
             _ => Err(err(
                 Msg::UnknownMethod {
                     ty: "Result".into(),
@@ -1818,6 +1839,11 @@ impl<'a> Runtime<'a> {
                 let v = args.first().cloned().unwrap_or(Value::Unit);
                 items.borrow_mut().push(v);
                 stack.push(Value::Unit);
+                Ok(true)
+            }
+            "contains" => {
+                let v = args.first().cloned().unwrap_or(Value::Unit);
+                stack.push(Value::Bool(items.borrow().contains(&v)));
                 Ok(true)
             }
             "get" => {

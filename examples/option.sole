@@ -1,0 +1,22 @@
+fn safe_div(a: int, b: int) -> Result[int, str]:
+    if b == 0:
+        return Err("division by zero")
+    return Ok(a / b)
+
+fn find(xs: List[int], target: int) -> Option[int]:
+    for x in ref xs:
+        if x == target:
+            return Some(x)
+    return None
+
+print(safe_div(10, 2).unwrap())
+
+print(safe_div(1, 0).is_err())
+
+print(find([1, 2, 3], 2).unwrap())
+
+print(find([1, 2, 3], 9).is_none())
+
+let parsed = "42".to_int()
+
+print(parsed.unwrap() + 8)

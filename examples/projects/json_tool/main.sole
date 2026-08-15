@@ -1,0 +1,253 @@
+import cli
+import stats
+import transform
+import path
+
+fn main(args: List[str]) -> int:
+    if args.len() < 1:
+        print(cli.usage())
+        return 1
+    let cmd = args[0]
+    if cmd == "get":
+        if args.len() < 3:
+            print("get needs <file> <path>")
+            return 1
+        return cmd_get(args[1], args[2])
+    if cmd == "keys":
+        if args.len() < 2:
+            print("keys needs <file>")
+            return 1
+        return cmd_keys(args[1])
+    if cmd == "len":
+        if args.len() < 3:
+            print("len needs <file> <path>")
+            return 1
+        return cmd_len(args[1], args[2])
+    if cmd == "pretty":
+        if args.len() < 2:
+            print("pretty needs <file>")
+            return 1
+        return cmd_pretty(args[1])
+    if cmd == "set":
+        if args.len() < 4:
+            print("set needs <file> <path> <value>")
+            return 1
+        return cmd_set(args[1], args[2], args[3])
+    if cmd == "delete":
+        if args.len() < 3:
+            print("delete needs <file> <path>")
+            return 1
+        return cmd_delete(args[1], args[2])
+    if cmd == "sum" or cmd == "avg" or cmd == "min" or cmd == "max":
+        if args.len() < 2:
+            print(cmd + " needs <file> [<path>]")
+            return 1
+        if args.len() > 2:
+            return cmd_agg(cmd, args[1], args[2])
+        return cmd_agg(cmd, args[1], "")
+    if cmd == "stats":
+        if args.len() < 2:
+            print("stats needs <file>")
+            return 1
+        return cmd_stats(args[1])
+    if cmd == "merge":
+        if args.len() < 3:
+            print("merge needs <fileA> <fileB>")
+            return 1
+        return cmd_merge(args[1], args[2])
+    print("unknown command: " + cmd)
+    print(cli.usage())
+    return 1
+
+fn run_with_args(args: List[str]) -> int:
+    return main(args)
+
+test main_rejects_empty:
+    assert main([]) == 1
+
+test main_unknown_command:
+    assert main(["frobnicate"]) == 1
+
+test main_get_missing_file:
+    assert main(["get", "/nonexistent/x.json", "a"]) == 1
+
+test main_get_missing_key:
+    let tmp = "examples/projects/json_tool/data.json"
+    let w = write(tmp, "{\"name\": \"sole\"}")
+    assert w.is_ok()
+    assert main(["get", tmp, "nope"]) == 1
+
+test main_get_finds_value:
+    let tmp = "examples/projects/json_tool/data.json"
+    assert main(["get", tmp, "name"]) == 0
+
+test main_keys_lists_keys:
+    let tmp = "examples/projects/json_tool/data.json"
+    assert main(["keys", tmp]) == 0
+
+test main_len_counts_elements:
+    let tmp = "examples/projects/json_tool/arr.json"
+    let w = write(tmp, "[1, 2, 3]")
+    assert w.is_ok()
+    assert main(["len", tmp, ""]) == 0
+
+test main_pretty_formats:
+    let tmp = "examples/projects/json_tool/arr.json"
+    assert main(["pretty", tmp]) == 0
+
+test main_path_errors:
+    let tmp = "examples/projects/json_tool/data.json"
+    assert main(["get", tmp, "a["]) == 1
+
+test end_to_end_get_nested:
+    let tmp = "examples/projects/json_tool/nested.json"
+    let w = write(tmp, "{\"users\": [{\"name\": \"ada\", \"age\": 36}, {\"name\": \"bob\"}]}")
+    assert w.is_ok()
+    assert main(["get", tmp, "users[1].name"]) == 0
+
+fn cmd_get(file: str, p: str) -> int:
+    let doc = cli.read_doc(file)
+    if doc.is_err():
+        print(doc.unwrap_err())
+        return 1
+    let parts = path.parse_path(p)
+    if parts.is_err():
+        print("bad path: " + parts.unwrap_err())
+        return 1
+    let v = path.lookup(doc.unwrap(), parts.unwrap())
+    if v.is_err():
+        print("lookup failed: " + v.unwrap_err())
+        return 1
+    print(v.unwrap().to_str())
+    return 0
+
+fn cmd_keys(file: str) -> int:
+    let doc = cli.read_doc(file)
+    if doc.is_err():
+        print(doc.unwrap_err())
+        return 1
+    let n = cli.print_keys(doc.unwrap(), "")
+    print("(" + n.to_str() + " keys)")
+    return 0
+
+fn cmd_len(file: str, p: str) -> int:
+    let doc = cli.read_doc(file)
+    if doc.is_err():
+        print(doc.unwrap_err())
+        return 1
+    let parts = path.parse_path(p)
+    if parts.is_err():
+        print("bad path: " + parts.unwrap_err())
+        return 1
+    let v = path.lookup(doc.unwrap(), parts.unwrap())
+    if v.is_err():
+        print("lookup failed: " + v.unwrap_err())
+        return 1
+    let val = v.unwrap()
+    print(val.len().to_str())
+    return 0
+
+fn cmd_pretty(file: str) -> int:
+    let doc = cli.read_doc(file)
+    if doc.is_err():
+        print(doc.unwrap_err())
+        return 1
+    print(cli.pretty_json(doc.unwrap(), ""))
+    return 0
+
+fn cmd_set(file: str, p: str, value: str) -> int:
+    let doc = cli.read_doc(file)
+    if doc.is_err():
+        print(doc.unwrap_err())
+        return 1
+    let parts = path.parse_path(p)
+    if parts.is_err():
+        print("bad path: " + parts.unwrap_err())
+        return 1
+    let parsed = json_decode(value)
+    if parsed.is_err():
+        print("value is not JSON: " + parsed.unwrap_err())
+        return 1
+    let out = transform.set_value(doc.unwrap(), parts.unwrap(), parsed.unwrap())
+    if out.is_ok():
+        print(json_encode(out.unwrap()))
+        return 0
+    print("set failed")
+    return 1
+
+fn cmd_delete(file: str, p: str) -> int:
+    let doc = cli.read_doc(file)
+    if doc.is_err():
+        print(doc.unwrap_err())
+        return 1
+    let parts = path.parse_path(p)
+    if parts.is_err():
+        print("bad path: " + parts.unwrap_err())
+        return 1
+    let out = transform.delete_value(doc.unwrap(), parts.unwrap())
+    if out.is_ok():
+        print(json_encode(out.unwrap()))
+        return 0
+    print("delete failed")
+    return 1
+
+fn cmd_agg(name: str, file: str, p: str) -> int:
+    let doc = cli.read_doc(file)
+    if doc.is_err():
+        print(doc.unwrap_err())
+        return 1
+    let mut root = doc.unwrap()
+    if p.len() > 0:
+        let parts = path.parse_path(p)
+        if parts.is_err():
+            print("bad path: " + parts.unwrap_err())
+            return 1
+        let v = path.lookup(root, parts.unwrap())
+        if v.is_err():
+            print("lookup failed: " + v.unwrap_err())
+            return 1
+        root = v.unwrap()
+    let mut result: Result[float, str] = Err("unknown aggregation")
+    if name == "sum":
+        result = stats.sum_values(root)
+    else if name == "avg":
+        result = stats.avg_values(root)
+    else if name == "min":
+        result = stats.min_values(root)
+    else:
+        result = stats.max_values(root)
+    if result.is_err():
+        print(name + ": " + result.unwrap_err())
+        return 1
+    print(result.unwrap().to_str())
+    return 0
+
+fn cmd_stats(file: str) -> int:
+    let doc = cli.read_doc(file)
+    if doc.is_err():
+        print(doc.unwrap_err())
+        return 1
+    let root = doc.unwrap()
+    print("numbers: " + stats.count_numbers(root).to_str())
+    print("keys: " + stats.count_keys_total(root).to_str())
+    print("depth: " + stats.depth_of(root).to_str())
+    let dist = stats.type_distribution(root)
+    for k in dist.keys():
+        print(k.to_str() + ": " + dist[k.to_str()].to_str())
+    return 0
+
+fn cmd_merge(a: str, b: str) -> int:
+    let doca = cli.read_doc(a)
+    if doca.is_err():
+        print(doca.unwrap_err())
+        return 1
+    let docb = cli.read_doc(b)
+    if docb.is_err():
+        print(docb.unwrap_err())
+        return 1
+    let m = transform.merge_json(doca.unwrap(), docb.unwrap())
+    if m.is_err():
+        print("merge failed: " + m.unwrap_err())
+        return 1
+    print(json_encode(m.unwrap()))
+    return 0

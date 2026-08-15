@@ -1,0 +1,81 @@
+fn parse_path(p: str) -> Result[List[Json], str]:
+    let mut parts: List[Json] = []
+    let mut buf = ""
+    let mut in_index = false
+    let mut index = ""
+    let n = p.len()
+    let mut i = 0
+    while i < n:
+        let c = p.sub(i, i + 1)
+        if c == "[":
+            if buf.len() > 0:
+                parts.push(buf)
+                buf = ""
+            in_index = true
+            index = ""
+        else if c == "]":
+            if index.len() == 0:
+                return Err("empty index in path")
+            let idx = index.to_int()
+            if idx.is_err():
+                return Err("bad index: " + index)
+            parts.push(idx.unwrap())
+            in_index = false
+        else if c == ".":
+            if in_index:
+                return Err("dot inside index")
+            if buf.len() > 0:
+                parts.push(buf)
+                buf = ""
+        else:
+            if in_index:
+                index = index + c
+            else:
+                buf = buf + c
+        i = i + 1
+    if in_index:
+        return Err("unclosed index")
+    if buf.len() > 0:
+        parts.push(buf)
+    return Ok(parts)
+
+fn lookup(root: Json, parts: List[Json]) -> Result[Json, str]:
+    let mut cur = root
+    for part in parts:
+        let key = part.to_str()
+        if cur.contains(key):
+            cur = cur[key]
+        else:
+            let idx = key.to_int()
+            if idx.is_ok():
+                let i = idx.unwrap()
+                if i < cur.len():
+                    cur = cur[i]
+                else:
+                    return Err("index out of range: " + key)
+            else:
+                return Err("no such key: " + key)
+    return Ok(cur)
+
+test parse_simple_path:
+    let p = parse_path("a.b.c").unwrap()
+    assert p.len() == 3
+
+test parse_index_path:
+    let p = parse_path("users[0].name").unwrap()
+    assert p.len() == 3
+    assert p[1] == 0
+
+test parse_bad_path:
+    assert parse_path("a[").is_err()
+
+test lookup_finds_value:
+    let doc = json_decode("{\"a\": {\"b\": [1, 2, 3]}}").unwrap()
+    let parts = parse_path("a.b[1]").unwrap()
+    let v = lookup(doc, parts).unwrap()
+    assert v == 2
+
+test lookup_missing_key:
+    let doc = json_decode("{}").unwrap()
+    let parts = parse_path("nope").unwrap()
+    assert lookup(doc, parts).is_err()

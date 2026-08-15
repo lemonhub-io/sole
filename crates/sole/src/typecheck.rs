@@ -187,6 +187,44 @@ pub struct Checker<'a> {
     borrows: HashMap<String, (String, bool)>,
 }
 
+/// Scope snapshot taken before an `if`: every variable declared so far plus
+/// the active borrow table. Each branch is checked from the same snapshot,
+/// then the branch effects are merged (see `Stmt::If` handling).
+struct ScopeSnapshot {
+    names: Vec<String>,
+    states: HashMap<String, State>,
+    borrows: HashMap<String, (String, bool)>,
+}
+
+/// A block diverges when control can never fall through its end: it ends in
+/// `return`, or in an `if` whose branches all diverge. Conservative: anything
+/// else counts as falling through.
+fn block_diverges(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Return { .. }) => true,
+        Some(stmt) => stmt_diverges(stmt),
+        None => false,
+    }
+}
+
+fn stmt_diverges(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            block_diverges(&then_block.stmts)
+                && match else_block {
+                    Some(ElseBranch::If(s)) => stmt_diverges(s),
+                    Some(ElseBranch::Block(block)) => block_diverges(&block.stmts),
+                    None => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 /// Checks a whole program for static type and borrow errors.
 pub fn check(program: &Program) -> Result<(), TypeError> {
     let mut checker = Checker {
@@ -277,6 +315,15 @@ impl<'a> Checker<'a> {
                 if args.is_empty() && type_params.iter().any(|(n, _)| n == name) {
                     return Ok(Ty::TypeVar(name.clone()));
                 }
+                // Recurse into generic arguments with the type params in
+                // scope (e.g. `List[T]`, `Option[T]`).
+                if !args.is_empty() {
+                    let rebuilt: Vec<Type> = args
+                        .iter()
+                        .map(|a| self.substitute_typevars(a, type_params))
+                        .collect();
+                    return self.ty_of_type(&Type::Named(name.clone(), rebuilt), self_ty);
+                }
                 self.ty_of_type(t, self_ty)
             }
             Type::Ref(inner) => Ok(Ty::Ref(Box::new(self.ty_of_type_with(
@@ -289,12 +336,37 @@ impl<'a> Checker<'a> {
                 self_ty,
                 type_params,
             )?))),
+            Type::TypeVar(name) => Ok(Ty::TypeVar(name.clone())),
+        }
+    }
+
+    /// Replaces type-parameter identifiers with `Type::TypeVar` markers.
+    fn substitute_typevars(&self, t: &Type, type_params: &[(String, Option<String>)]) -> Type {
+        match t {
+            Type::Named(name, args) => {
+                if args.is_empty() && type_params.iter().any(|(n, _)| n == name) {
+                    Type::TypeVar(name.clone())
+                } else {
+                    Type::Named(
+                        name.clone(),
+                        args.iter()
+                            .map(|a| self.substitute_typevars(a, type_params))
+                            .collect(),
+                    )
+                }
+            }
+            Type::Ref(inner) => Type::Ref(Box::new(self.substitute_typevars(inner, type_params))),
+            Type::MutRef(inner) => {
+                Type::MutRef(Box::new(self.substitute_typevars(inner, type_params)))
+            }
+            Type::TypeVar(name) => Type::TypeVar(name.clone()),
         }
     }
 
     /// Resolves a parsed type to a `Ty`. `self_ty` substitutes `Self`.
     fn ty_of_type(&self, t: &Type, self_ty: Option<&Ty>) -> Result<Ty, TypeError> {
         match t {
+            Type::TypeVar(name) => Ok(Ty::TypeVar(name.clone())),
             Type::Named(name, args) => {
                 if args.is_empty() {
                     // Type variable (generic parameter) or plain type name.
@@ -303,6 +375,7 @@ impl<'a> Checker<'a> {
                         "float" => return Ok(Ty::Float),
                         "bool" => return Ok(Ty::Bool),
                         "str" => return Ok(Ty::Str),
+                        "Json" => return Ok(Ty::Json),
                         "Self" => {
                             if let Some(st) = self_ty {
                                 return Ok(st.deref().clone());
@@ -527,6 +600,53 @@ impl<'a> Checker<'a> {
         if let Some(scope) = self.vars.last_mut() {
             scope.insert(name, Var::new(ty, mutable));
         }
+    }
+
+    /// Snapshots the current scope's variables and borrow table so an `if`
+    /// branch can be checked in isolation and merged back.
+    fn snapshot_scope(&self) -> ScopeSnapshot {
+        let mut names = Vec::new();
+        let mut states = HashMap::new();
+        if let Some(scope) = self.vars.last() {
+            for (k, v) in scope {
+                names.push(k.clone());
+                states.insert(k.clone(), v.state);
+            }
+        }
+        ScopeSnapshot {
+            names,
+            states,
+            borrows: self.borrows.clone(),
+        }
+    }
+
+    /// Restores the states of variables present in the snapshot and the
+    /// borrow table. Variables declared inside a branch keep their end state.
+    fn restore_scope(&mut self, snapshot: &ScopeSnapshot) {
+        if let Some(scope) = self.vars.last_mut() {
+            for (name, state) in &snapshot.states {
+                if let Some(v) = scope.get_mut(name) {
+                    v.state = *state;
+                }
+            }
+        }
+        self.borrows = snapshot.borrows.clone();
+    }
+
+    /// Names from the snapshot whose current state is `Moved` (moved inside
+    /// the branch that was just checked).
+    fn moved_names(&self, snapshot: &ScopeSnapshot) -> Vec<String> {
+        snapshot
+            .names
+            .iter()
+            .filter(|n| {
+                matches!(
+                    self.vars.last().and_then(|s| s.get(*n)),
+                    Some(v) if v.state == State::Moved
+                )
+            })
+            .cloned()
+            .collect()
     }
 
     /// Reads a variable: `Moved` 闂?error. `BorrowedMut` 闂?conflict error.
@@ -994,12 +1114,46 @@ impl<'a> Checker<'a> {
                         *span,
                     ));
                 }
+                // Branch merge: each branch is checked from the same pre-`if`
+                // state. Borrows created inside a branch die with it; a move
+                // takes effect after the `if` unless every path reaching the
+                // code after it leaves the value untouched (a diverging
+                // branch — one that always returns — does not participate).
+                let snapshot = self.snapshot_scope();
                 self.check_block(then_block)?;
-                match else_block {
-                    Some(ElseBranch::If(stmt)) => self.check_stmt(stmt)?,
-                    Some(ElseBranch::Block(block)) => self.check_block(block)?,
-                    None => {}
+                let then_moved = self.moved_names(&snapshot);
+                let then_diverges = block_diverges(&then_block.stmts);
+                self.restore_scope(&snapshot);
+                let (else_moved, else_diverges) = match else_block {
+                    Some(ElseBranch::If(stmt)) => {
+                        self.check_stmt(stmt)?;
+                        let moved = self.moved_names(&snapshot);
+                        let diverges = stmt_diverges(stmt);
+                        self.restore_scope(&snapshot);
+                        (moved, diverges)
+                    }
+                    Some(ElseBranch::Block(block)) => {
+                        self.check_block(block)?;
+                        let moved = self.moved_names(&snapshot);
+                        let diverges = block_diverges(&block.stmts);
+                        self.restore_scope(&snapshot);
+                        (moved, diverges)
+                    }
+                    // No else: the fall-through path keeps the pre-`if` state.
+                    None => (Vec::new(), false),
+                };
+                if !(then_diverges && else_diverges) {
+                    for name in snapshot.names {
+                        let moved_in_then = !then_diverges && then_moved.contains(&name);
+                        let moved_in_else = !else_diverges && else_moved.contains(&name);
+                        if moved_in_then || moved_in_else {
+                            if let Some(v) = self.lookup_mut(&name) {
+                                v.state = State::Moved;
+                            }
+                        }
+                    }
                 }
+                self.borrows = snapshot.borrows;
                 Ok(())
             }
             Stmt::While { cond, body, span } => {
@@ -1770,27 +1924,8 @@ impl<'a> Checker<'a> {
                 ));
             }
             for (a, (_, pty)) in args.iter().zip(&sig.params) {
-                if let Ty::TypeVar(tv) = pty {
-                    let actual = self.infer_expr(a)?;
-                    match bindings.get(tv) {
-                        Some(prev) => {
-                            if !types_compatible(prev, &actual) {
-                                return Err(err(
-                                    Msg::ArgTypeMismatch {
-                                        func: sig.name.clone(),
-                                        index: 0,
-                                        expected: prev.name(),
-                                        actual: actual.name(),
-                                    },
-                                    span,
-                                ));
-                            }
-                        }
-                        None => {
-                            bindings.insert(tv.clone(), actual);
-                        }
-                    }
-                }
+                let actual = self.infer_expr(a)?;
+                collect_bindings(pty, &actual, &mut bindings);
             }
             // Check constraints (e.g. `T: Comparable`).
             for (tv, bound) in &sig.type_params {
@@ -1813,6 +1948,17 @@ impl<'a> Checker<'a> {
         fn subst(t: &Ty, bindings: &HashMap<String, Ty>) -> Ty {
             match t {
                 Ty::TypeVar(tv) => bindings.get(tv).cloned().unwrap_or_else(|| t.clone()),
+                Ty::List(inner) => Ty::List(Box::new(subst(inner, bindings))),
+                Ty::Chan(inner) => Ty::Chan(Box::new(subst(inner, bindings))),
+                Ty::Option(inner) => Ty::Option(Box::new(subst(inner, bindings))),
+                Ty::Result(a, b) => {
+                    Ty::Result(Box::new(subst(a, bindings)), Box::new(subst(b, bindings)))
+                }
+                Ty::Dict(a, b) => {
+                    Ty::Dict(Box::new(subst(a, bindings)), Box::new(subst(b, bindings)))
+                }
+                Ty::Set(inner) => Ty::Set(Box::new(subst(inner, bindings))),
+                Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| subst(t, bindings)).collect()),
                 Ty::Ref(inner) => Ty::Ref(Box::new(subst(inner, bindings))),
                 Ty::MutRef(inner) => Ty::MutRef(Box::new(subst(inner, bindings))),
                 other => other.clone(),
@@ -1935,6 +2081,7 @@ impl<'a> Checker<'a> {
         match &base {
             Ty::List(inner) => self.infer_list_method(obj, inner, name, args, span),
             Ty::Chan(inner) => self.infer_chan_method(obj, inner, name, args, span),
+            Ty::Json => self.infer_json_method(obj, name, args, span),
             Ty::Str => self.infer_str_method(obj, name, args, span),
             Ty::Dict(k, v) => self.infer_dict_method(obj, k, v, name, args, span),
             Ty::Set(inner) => self.infer_set_method(obj, inner, name, args, span),
@@ -2010,6 +2157,66 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Checks a builtin `Json` method call (`len` / `contains`); dispatch
+    /// happens at runtime on the underlying value.
+    fn infer_json_method(
+        &mut self,
+        _obj: &Expr,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Ty, TypeError> {
+        match name {
+            "len" => {
+                if !args.is_empty() {
+                    return Err(err(Msg::ArgCount("Json.len".into(), 0, args.len()), span));
+                }
+                Ok(Ty::Int)
+            }
+            "contains" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        Msg::ArgCount("Json.contains".into(), 1, args.len()),
+                        span,
+                    ));
+                }
+                self.infer_expr(&args[0])?;
+                Ok(Ty::Bool)
+            }
+            "keys" => {
+                if !args.is_empty() {
+                    return Err(err(Msg::ArgCount("Json.keys".into(), 0, args.len()), span));
+                }
+                Ok(Ty::List(Box::new(Ty::Json)))
+            }
+            "is_int" | "is_str" => {
+                if !args.is_empty() {
+                    return Err(err(
+                        Msg::ArgCount(format!("Json.{}", name), 0, args.len()),
+                        span,
+                    ));
+                }
+                Ok(Ty::Bool)
+            }
+            "to_str" => {
+                if !args.is_empty() {
+                    return Err(err(
+                        Msg::ArgCount("Json.to_str".into(), 0, args.len()),
+                        span,
+                    ));
+                }
+                Ok(Ty::Str)
+            }
+            _ => Err(err(
+                Msg::UnknownMethod {
+                    ty: "Json".into(),
+                    method: name.to_string(),
+                },
+                span,
+            )),
+        }
+    }
+
     /// Checks a builtin `str` method call.
     fn infer_str_method(
         &mut self,
@@ -2066,6 +2273,10 @@ impl<'a> Checker<'a> {
                 expect(1)?;
                 self.check_str_arg(&args[0], &format!("str.{}", name))?;
                 Ok(Ty::Bool)
+            }
+            "trim" => {
+                expect(0)?;
+                Ok(Ty::Str)
             }
             "to_int" => {
                 expect(0)?;
@@ -2357,6 +2568,10 @@ impl<'a> Checker<'a> {
                 expect(0)?;
                 Ok(ok.clone())
             }
+            "unwrap_err" => {
+                expect(0)?;
+                Ok(Ty::Unknown)
+            }
             _ => Err(err(
                 Msg::UnknownMethod {
                     ty: "Result".into(),
@@ -2423,6 +2638,27 @@ impl<'a> Checker<'a> {
                     return Err(err(Msg::ArgCount("List.len".into(), 0, args.len()), span));
                 }
                 Ok(Ty::Int)
+            }
+            "contains" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        Msg::ArgCount("List.contains".into(), 1, args.len()),
+                        span,
+                    ));
+                }
+                let t = self.infer_expr_consume(&args[0], span)?;
+                if !self.is_compatible(inner, &t) && !matches!(inner, Ty::Unknown) {
+                    return Err(err(
+                        Msg::ArgTypeMismatch {
+                            func: "List.contains".into(),
+                            index: 0,
+                            expected: inner.name(),
+                            actual: t.name(),
+                        },
+                        span,
+                    ));
+                }
+                Ok(Ty::Bool)
             }
             "push" => {
                 if args.len() != 1 {
@@ -2638,6 +2874,10 @@ fn types_compatible(expected: &Ty, actual: &Ty) -> bool {
     if matches!(expected, Ty::Unknown) || matches!(actual, Ty::Unknown) {
         return true;
     }
+    // `Json` accepts any JSON-serializable value (dynamic value).
+    if matches!(expected, Ty::Json) || matches!(actual, Ty::Json) {
+        return true;
+    }
     match (expected, actual) {
         (Ty::List(a), Ty::List(b)) => types_compatible(a, b),
         (Ty::Chan(a), Ty::Chan(b)) => types_compatible(a, b),
@@ -2660,6 +2900,68 @@ fn types_compatible(expected: &Ty, actual: &Ty) -> bool {
 /// Records the last statement index at which each variable is used (NLL).
 /// Nested blocks use the enclosing statement's index, which is conservative:
 /// borrows may outlive their NLL point by one statement, never the reverse.
+/// Walks `expected`, binding type variables to the corresponding parts of
+/// `actual` (e.g. `List[T]` against `List[int]` binds `T -> int`).
+fn collect_bindings(expected: &Ty, actual: &Ty, bindings: &mut HashMap<String, Ty>) {
+    match expected {
+        Ty::TypeVar(tv) => match bindings.get(tv) {
+            Some(prev) => {
+                if !types_compatible(prev, actual) && !matches!(actual, Ty::Unknown) {
+                    bindings.insert(tv.clone(), actual.clone());
+                }
+            }
+            None => {
+                bindings.insert(tv.clone(), actual.clone());
+            }
+        },
+        Ty::List(inner) => {
+            if let Ty::List(a) = actual {
+                collect_bindings(inner, a, bindings);
+            }
+        }
+        Ty::Option(inner) => {
+            if let Ty::Option(a) = actual {
+                collect_bindings(inner, a, bindings);
+            }
+        }
+        Ty::Set(inner) => {
+            if let Ty::Set(a) = actual {
+                collect_bindings(inner, a, bindings);
+            }
+        }
+        Ty::Ref(inner) => {
+            if let Ty::Ref(a) = actual {
+                collect_bindings(inner, a, bindings);
+            }
+        }
+        Ty::MutRef(inner) => {
+            if let Ty::MutRef(a) = actual {
+                collect_bindings(inner, a, bindings);
+            }
+        }
+        Ty::Result(a1, b1) => {
+            if let Ty::Result(a2, b2) = actual {
+                collect_bindings(a1, a2, bindings);
+                collect_bindings(b1, b2, bindings);
+            }
+        }
+        Ty::Dict(a1, b1) => {
+            if let Ty::Dict(a2, b2) = actual {
+                collect_bindings(a1, a2, bindings);
+                collect_bindings(b1, b2, bindings);
+            }
+        }
+        Ty::Tuple(ts) => {
+            if let Ty::Tuple(us) = actual {
+                for (t, u) in ts.iter().zip(us) {
+                    collect_bindings(t, u, bindings);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_uses(stmt: &Stmt, uses: &mut HashMap<String, usize>, idx: usize) {
     fn expr_uses(expr: &Expr, uses: &mut HashMap<String, usize>, idx: usize) {
         match expr {
@@ -3072,6 +3374,74 @@ mod tests {
     #[test]
     fn while_body_borrow_dies_with_loop() {
         check_ok("let a = [1, 2]\nlet mut n = 0\nwhile n < 1:\n    let r = ref a\n    n = n + 1\nlet b = a\nprint(b.len())\n");
+    }
+
+    // ---- M4 收尾: if 分支合并(发散分支不参与)----
+
+    #[test]
+    fn move_in_diverging_branch_does_not_leak() {
+        // `parts` is moved inside a branch that always returns; the
+        // fall-through path never runs it, so `parts` stays usable after.
+        check_ok(
+            "fn f(root: Json, parts: List[Json], value: Json) -> Result[Json, str]:
+    let head = parts[0]
+    if head.is_int():
+        let r = parts
+        print(r.len())
+        return Ok(value)
+    let rest = parts
+    print(rest.len())
+    return Ok(head)
+",
+        );
+    }
+
+    #[test]
+    fn move_in_else_branch_does_not_leak_when_it_returns() {
+        check_ok(
+            "fn f(parts: List[Json]) -> Json:
+    let head = parts[0]
+    if head.is_int():
+        print(head)
+    else:
+        let r = parts
+        return r[0]
+    let rest = parts
+    return rest[0]
+",
+        );
+    }
+
+    #[test]
+    fn tail_if_with_both_branches_returning_diverges() {
+        check_ok(
+            "fn f(parts: List[Json]) -> Json:
+    let head = parts[0]
+    if head.is_int():
+        if head.to_str() == \"1\":
+            let r = parts
+            return r[0]
+        else:
+            return head
+    let rest = parts
+    return rest[0]
+",
+        );
+    }
+
+    #[test]
+    fn move_in_non_diverging_branch_still_leaks() {
+        let msg = check_err(
+            "fn f(parts: List[Json]) -> Json:
+    let head = parts[0]
+    if head.is_int():
+        let r = parts
+        print(r.len())
+    let rest = parts
+    return rest[0]
+",
+        );
+        assert!(msg.contains("[E0401]"), "msg: {msg}");
     }
 
     #[test]

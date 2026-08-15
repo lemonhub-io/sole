@@ -278,6 +278,7 @@ fn format_type(t: &sole_parser::Type) -> String {
         }
         sole_parser::Type::Ref(inner) => format!("ref {}", format_type(inner)),
         sole_parser::Type::MutRef(inner) => format!("mut ref {}", format_type(inner)),
+        sole_parser::Type::TypeVar(name) => name.clone(),
     }
 }
 

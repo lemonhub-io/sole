@@ -1,0 +1,19 @@
+let config = json_decode("{\"name\": \"sole\", \"version\": 1, \"features\": [\"types\", \"borrow\", \"chan\"]}")
+
+print(config.is_ok())
+
+let c = config.unwrap()
+
+print(c["name"])
+
+print(c["version"])
+
+print(c["features"][2])
+
+let out = json_decode("{\"ok\": true, \"count\": 3}").unwrap()
+
+print(json_encode(out))
+
+let bad = json_decode("{not json}")
+
+print(bad.is_err())

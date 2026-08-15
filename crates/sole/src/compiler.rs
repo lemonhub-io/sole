@@ -427,16 +427,15 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expr::Unary { op, expr, .. } => {
-                self.compile_expr(expr, code, ctx)?;
                 match op {
                     UnOp::Neg => {
-                        // Negate int or float at runtime via a dedicated op:
-                        // reuse PushInt(0) + Sub for simplicity.
+                        // Negate via `0 - x`: pushes exactly one value.
                         code.push(Instr::PushInt(0));
                         self.compile_expr(expr, code, ctx)?;
                         code.push(Instr::Binary(crate::vm::BinOp::Sub));
                     }
                     UnOp::Not => {
+                        self.compile_expr(expr, code, ctx)?;
                         code.push(Instr::Not);
                     }
                 }

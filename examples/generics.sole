@@ -1,0 +1,30 @@
+fn max[T: Comparable](a: T, b: T) -> T:
+    if a > b:
+        return a
+    return b
+
+fn clamp[T: Comparable](x: T, lo: T, hi: T) -> T:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+fn first[T](xs: List[T]) -> Option[T]:
+    if xs.len() > 0:
+        return Some(xs[0])
+    return None
+
+print(max(3, 9))
+
+print(max("apple", "banana"))
+
+print(clamp(5, 0, 3))
+
+print(clamp(-2, 0, 3))
+
+print(first([10, 20]).unwrap())
+
+let empty: List[int] = []
+
+print(first(empty).is_none())

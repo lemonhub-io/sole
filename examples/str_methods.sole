@@ -1,0 +1,33 @@
+let s = "hello, sole world"
+
+print(s.len())
+
+print(s.sub(0, 5))
+
+print(s.sub(7, 11))
+
+let parts = s.split(" ")
+
+print(parts.len())
+
+print("-".join(parts))
+
+print(s.contains("sole"))
+
+print(s.starts_with("hello"))
+
+print(s.ends_with("world"))
+
+print(3.14.to_str())
+
+print(42.to_str())
+
+print(true.to_str())
+
+let n = "255".to_int().unwrap()
+
+print(n + 1)
+
+let pi = "3.14".to_float().unwrap()
+
+print(pi * 2.0)

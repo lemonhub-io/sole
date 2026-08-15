@@ -106,6 +106,8 @@ pub enum Type {
     Named(String, Vec<Type>),
     Ref(Box<Type>),
     MutRef(Box<Type>),
+    /// Generic parameter reference (produced by the checker, not parsed).
+    TypeVar(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,0 +1,41 @@
+let scores: Dict[str, int] = {"alice": 90, "bob": 85}
+
+scores.set("carol", 95)
+
+print(scores.len())
+
+print(scores.get("bob").unwrap())
+
+print(scores.contains("dave"))
+
+scores.remove("alice")
+
+print(scores.contains("alice"))
+
+print(scores.keys())
+
+print(scores.values())
+
+let seen: Set[int] = {1, 2, 3, 2, 1}
+
+print(seen.len())
+
+seen.add(4)
+
+print(seen.contains(4))
+
+seen.remove(2)
+
+print(seen.contains(2))
+
+let point = (10, 20)
+
+let person = ("ada", 36, true)
+
+print(point[0] + point[1])
+
+print(person[0])
+
+print(person[2])
+
+print(person.len())

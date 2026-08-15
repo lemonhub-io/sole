@@ -250,6 +250,24 @@ impl<'a> Lexer<'a> {
                 _ => break,
             }
         }
+        // Scientific notation: `1e5`, `1.5e-3`, `2E+10`. An `e`/`E` without
+        // digits after it (`1e`, `2x`) is not an exponent: backtrack so the
+        // letter lexes as an identifier.
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            let save = self.pos;
+            self.advance();
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                self.advance();
+            }
+            if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                is_float = true;
+                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.advance();
+                }
+            } else {
+                self.pos = save;
+            }
+        }
         let text = std::str::from_utf8(&self.src[start..self.pos])
             .expect("number text is ASCII")
             .replace('_', "");
@@ -542,6 +560,37 @@ mod tests {
             vec![
                 TokenKind::Int(1_000_000),
                 TokenKind::Float(2.5),
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn float_scientific_notation() {
+        assert_eq!(
+            kinds("1e300 1.5e-3 2E+10 1_000e2\n"),
+            vec![
+                TokenKind::Float(1e300),
+                TokenKind::Float(1.5e-3),
+                TokenKind::Float(2e10),
+                TokenKind::Float(100_000.0),
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_e_is_not_an_exponent() {
+        // `1e` is an int `1` followed by the identifier `e`, not an exponent.
+        assert_eq!(
+            kinds("1e 2x\n"),
+            vec![
+                TokenKind::Int(1),
+                TokenKind::Ident("e".into()),
+                TokenKind::Int(2),
+                TokenKind::Ident("x".into()),
                 TokenKind::Newline,
                 TokenKind::Eof,
             ]
