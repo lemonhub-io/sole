@@ -4,6 +4,7 @@
 
 pub mod compiler;
 pub mod fmt;
+pub mod lsp;
 pub mod typecheck;
 pub mod vm;
 

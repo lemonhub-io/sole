@@ -39,7 +39,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
-            "run" | "test" | "fmt" => {
+            "run" | "test" | "fmt" | "lsp" => {
                 cmd = Some(args[i].clone());
                 i += 1;
             }
@@ -65,6 +65,15 @@ fn main() -> ExitCode {
     }
     if cmd.as_deref() == Some("fmt") {
         return fmt_main(&pos, fmt_check);
+    }
+    if cmd.as_deref() == Some("lsp") {
+        return match sole::lsp::run_server() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                ExitCode::from(1)
+            }
+        };
     }
     match path {
         Some(path) => {
@@ -119,6 +128,7 @@ fn main() -> ExitCode {
             eprintln!("  sole run [--lang en|zh] <file>    run a .sole script");
             eprintln!("  sole test [--lang en|zh] <file>   run the `test` blocks");
             eprintln!("  sole fmt [--check] <file|dir>...  format .sole files");
+            eprintln!("  sole lsp                          start the LSP server");
             eprintln!("  sole --version                    print version");
             eprintln!("(error messages default to English; SOLE_LANG env var also works)");
             ExitCode::from(2)

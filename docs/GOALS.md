@@ -216,6 +216,17 @@
 - **后置**(§7.5/§6.1 按需): HTTP 客户端、`Shared[T]`/`Mutex`、包管理
 - 运行时线性容器(无哈希)与 `Json` 的动态性均为诚实记录的简化
 
+### D14. 工具链: formatter 与 LSP(2026-08-14 定)
+
+- **formatter**(§9.1 官方唯一格式,类 gofmt): AST → 规范文本;4 空格缩进、
+  运算符/逗号/泛型参数规范化、if-else 链重排;**幂等**(格式化两次不变);
+  **语义保持**(括号按优先级/结合性重排、float 保形 `1.0`、字符串重转义);
+  注释由词法器丢弃(源码中不保留);CLI `sole fmt <file|dir>` / `sole fmt --check`
+- **LSP**(§9.1): 手写 JSON-RPC 2.0 over stdio;full-sync 文档更新;
+  `publishDiagnostics` 复用类型检查器(双语渲染 + 稳定错误码);
+  跳转定义(函数/类型/test/let 绑定,光标在词尾也可);补全(关键字 + 符号表);
+  hover 与增量同步未实现(诚实记录);CLI `sole lsp`
+
 ---
 
 ## 4. 类型系统目标 (Type System)
@@ -452,13 +463,17 @@
 | 2026-08-11 | **M1 完成**: 新增 `sole-parser` AST 全节点 `Span`(行列)定位;新增 `sole` crate `typecheck` 模块(M1 简单静态类型检查: 标注/赋值/函数签名/运算符/迭代,错误码 E03xx 段);`run_source` 管线改为 lex → parse → typecheck → eval;求值错误带位置 | 对齐 M1 验收"简单类型检查"与 GOALS §9.2 错误定位要求 |
 | 2026-08-11 | 移除"iSH 内存受限、本地不运行 rustc、编译测试由 GitHub Actions 承担"的表述: 开发环境资源充足,编译/格式化/lint/测试恢复本地执行(README 与 §10.3 同步) | 开发环境变更,旧表述不再适用 |
 | 2026-08-11 | **M2 完成**: 类型系统扩展(List[T]/Struct/Interface/Ref/MutRef,含接口子类型兼容);新增 `struct`/`interface`/`impl` 语法与方法调用(含 `self` 借用);移动语义与借用检查(use-after-move/借用期间移动/可变借用冲突/借用逃逸,错误码 E04xx 段);eval 改造为 `Rc<RefCell>` 单元实现引用共享;List 字面量/索引/内置方法;字段赋值 `obj.field = v` | 对齐 M2 验收"静态类型检查器(完整,含移动语义与最小借用规则)";借用为最小规则集,字段级借用与借用传播已支持,索引借用与细粒度留 M3 |
-| 2026-08-14 | **M4 阶段 1(标准库核心)**: 定 D13 并实现——`import`/`from`
+| 2026-08-14 | **M4 阶段 2-3(formatter + LSP)**: 定 D14 并实现——formatter
+    (幂等 + 语义保持,全示例验证)与 `sole fmt`/`--check`(CI 接入);
+    LSP server(initialize/shutdown、full-sync 诊断复用 typechecker 双语渲染、
+    跳转定义、补全,6 个进程级集成测试) | 工具链: 官方格式与编辑支持可用,
+    AI 可依赖的确定性格式与即时诊断 | 定 D13 并实现——`import`/`from`
     模块机制(多文件加载、循环去重、前缀重写、from 名称校验);
     标准库内建函数: 文件 IO(read_to_str/write)、时间(clock/sleep)、
     数学(abs/floor/ceil/round/sqrt/pow)、JSON(json_encode/json_decode +
     Json 动态类型);`None` 在集合字面量中作"洞"支持异构 JSON 字面量 |
     模块化 + 标准库核心全链路可用,单测覆盖;HTTP/Shared/Mutex 按 D13 后置 |
-| 2026-08-14 | **M4 阶段 0(语言地基)**: 定 D8-D12 并实现——`Option[T]`/`Result[T,E]`
+| 2026-08-14 | **M4 阶段 1(标准库核心)**: 定 D8-D12 并实现——`Option[T]`/`Result[T,E]`
    构造与解包(Some/None/Ok/Err、is_some/is_none/is_ok/is_err/unwrap,错误码 E0219/E0220);
    泛型函数与 `Comparable` 约束(E0320)、调用点实例化;
    `Dict[K,V]`(索引/方法,get 返回 Option)、`Set[T]`(元素唯一)、`Tuple`(索引);

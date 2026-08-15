@@ -48,6 +48,7 @@ pub struct FnDef {
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -477,6 +478,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_fn(&mut self) -> Result<FnDef, ParseError> {
+        let span = self.here_span();
         self.expect(&TokenKind::Fn, "fn")?;
         let name = self.expect_ident(IdentKind::FnName)?;
         let type_params = if self.at(&TokenKind::LBracket) {
@@ -533,6 +535,7 @@ impl<'a> Parser<'a> {
             params,
             ret,
             body,
+            span,
         })
     }
 
