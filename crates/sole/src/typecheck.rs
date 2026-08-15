@@ -2,7 +2,7 @@
 //!
 //! Full type checking for the M1/M2 language subset: literals, annotations,
 //! assignment, function signatures, calls, operators, loops, `List[T]`,
-//! structs, interfaces, and methods 闂?plus a flow-sensitive borrow/move
+//! structs, interfaces, and methods plus a flow-sensitive borrow/move
 //! checker (use-after-move, moves while borrowed, mutable borrow conflicts,
 //! borrow escape). Copy types (`int`/`float`/`bool`/`str`/`ref`) are exempt
 //! from move semantics.
@@ -649,7 +649,7 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
-    /// Reads a variable: `Moved` 闂?error. `BorrowedMut` 闂?conflict error.
+    /// Reads a variable: `Moved` error. `BorrowedMut` conflict error.
     fn read_var(&self, name: &str, span: Span) -> Result<Ty, TypeError> {
         match self.lookup(name) {
             Some(v) => match v.state {
@@ -1279,7 +1279,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// `return ref ...` 闂?the returned reference must derive from a
+    /// `return ref ...` the returned reference must derive from a
     /// reference parameter (borrow propagation); locals escape.
     fn check_ref_return(
         &mut self,

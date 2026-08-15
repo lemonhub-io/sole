@@ -3,7 +3,7 @@
 //! Programs are compiled to bytecode (`compiler.rs`) and executed by this
 //! stack-based VM. Tasks (coroutines) are VM instances with their own value
 //! and frame stacks, scheduled cooperatively: switching happens only at
-//! channel operations and `yield` (GOALS 闂?). Channels implement the
+//! channel operations and `yield` (GOALS ). Channels implement the
 //! ownership-moving send/recv semantics; `task_group` provides structured
 //! concurrency with cancellation (= closing channels).
 
@@ -107,7 +107,7 @@ pub enum Instr {
     PushGlobal(u32),
     StoreVar(u32),
     StoreGlobal(u32),
-    /// `BorrowVar(mutable, idx)` 闂?Ref/MutRef of the variable's cell.
+    /// `BorrowVar(mutable, idx)` Ref/MutRef of the variable's cell.
     BorrowVar(bool, u32),
     MakeList(u32),
     ListLen,
@@ -137,6 +137,7 @@ pub enum Instr {
     Pop,
     Dup,
     Not,
+    Neg,
     Binary(BinOp),
     /// Stops the current frame's function (implicit return at block end).
     RetUnit,
@@ -176,6 +177,9 @@ pub struct Function {
     pub nparams: u32,
     pub nlocals: u32,
     pub code: Vec<Instr>,
+    /// Source line per instruction (`code[i]` was emitted from line
+    /// `lines[i]`); used to locate runtime errors.
+    pub lines: Vec<u32>,
 }
 
 /// Compiled program: functions, globals, string table, method table.
@@ -184,9 +188,9 @@ pub struct CompiledProgram {
     pub functions: Vec<Function>,
     pub globals: Vec<String>,
     pub strings: Vec<Rc<str>>,
-    /// (struct type name, method name) 闂?function index.
+    /// (struct type name, method name) function index.
     pub methods: Vec<((String, String), usize)>,
-    /// struct name 闂?field names (construction order).
+    /// struct name field names (construction order).
     pub structs: Vec<(String, Vec<String>)>,
     /// chan element type names (unused at runtime; kept for error messages).
     pub chan_elem: Vec<String>,
@@ -210,6 +214,19 @@ impl std::error::Error for VmError {}
 fn err(msg: Msg, line: usize, column: usize) -> VmError {
     VmError {
         diag: Diagnostic::new(msg, line, column),
+    }
+}
+
+impl<'a> Runtime<'a> {
+    /// Source line of the instruction the given task is currently executing.
+    /// The task's `ip` has already advanced past it, so the line of the
+    /// instruction being executed is `ip - 1`.
+    fn line_at(&self, task: &Task) -> usize {
+        let Some(frame) = task.frames.last() else {
+            return 0;
+        };
+        let lines = &self.prog.functions[frame.func].lines;
+        lines.get(task.ip.saturating_sub(1)).copied().unwrap_or(0) as usize
     }
 }
 
@@ -255,7 +272,7 @@ pub struct Runtime<'a> {
     pub channels: Vec<Rc<RefCell<Channel>>>,
     pub tasks: Vec<Option<Box<Task>>>,
     pub task_states: Vec<TaskState>,
-    /// group id 闂?set of task ids in it (not yet finished).
+    /// group id set of task ids in it (not yet finished).
     pub groups: Vec<Vec<usize>>,
     pub current: usize,
     pub out: &'a mut dyn std::io::Write,
@@ -290,7 +307,7 @@ impl<'a> Runtime<'a> {
             .unwrap_or(Value::Unit)
     }
 
-    fn set_global(&mut self, name: &str, value: Value) -> Result<(), VmError> {
+    fn set_global(&mut self, name: &str, value: Value, line: usize) -> Result<(), VmError> {
         if let Some(cell) = self.globals.get(name) {
             let cur = cell.borrow().clone();
             match cur {
@@ -298,7 +315,7 @@ impl<'a> Runtime<'a> {
                     *target.borrow_mut() = value;
                 }
                 Value::Ref(_) => {
-                    return Err(err(Msg::ImmutableReassign(name.into()), 0, 0));
+                    return Err(err(Msg::ImmutableReassign(name.into()), line, 0));
                 }
                 _ => {
                     *cell.borrow_mut() = value;
@@ -446,7 +463,7 @@ impl<'a> Runtime<'a> {
         loop {
             budget -= 1;
             if budget == 0 {
-                return Err(err(Msg::InternalFnIndex, 0, 0));
+                return Err(err(Msg::InternalFnIndex, self.line_at(task), 0));
             }
             // Refresh the cached code slice only when the frame's function
             // changed (Call/Return); the common path skips the functions
@@ -548,7 +565,11 @@ impl<'a> Runtime<'a> {
                                 *target.borrow_mut() = v;
                             }
                             Value::Ref(_) => {
-                                return Err(err(Msg::ImmutableReassign("<ref>".into()), 0, 0));
+                                return Err(err(
+                                    Msg::ImmutableReassign("<ref>".into()),
+                                    self.line_at(task),
+                                    0,
+                                ));
                             }
                             _ => {
                                 *cell.borrow_mut() = v;
@@ -561,7 +582,11 @@ impl<'a> Runtime<'a> {
                                 *target.borrow_mut() = v;
                             }
                             Value::Ref(_) => {
-                                return Err(err(Msg::ImmutableReassign("<ref>".into()), 0, 0));
+                                return Err(err(
+                                    Msg::ImmutableReassign("<ref>".into()),
+                                    self.line_at(task),
+                                    0,
+                                ));
                             }
                             _ => {
                                 *slot = v;
@@ -572,7 +597,7 @@ impl<'a> Runtime<'a> {
                 Instr::StoreGlobal(i) => {
                     let v = task.stack.pop().unwrap_or(Value::Unit);
                     let name = prog.globals[*i as usize].clone();
-                    self.set_global(&name, v)?;
+                    self.set_global(&name, v, self.line_at(task))?;
                 }
                 Instr::BorrowVar(mutable, i) => {
                     let cell = {
@@ -617,7 +642,7 @@ impl<'a> Runtime<'a> {
                     let idx = task.stack.pop().unwrap_or(Value::Int(0));
                     let list = task.stack.pop().unwrap_or(Value::Unit);
                     let Value::Int(i) = idx else {
-                        return Err(err(Msg::IndexNotInt, 0, 0));
+                        return Err(err(Msg::IndexNotInt, self.line_at(task), 0));
                     };
                     let item = match list {
                         Value::List(items) => items
@@ -625,7 +650,13 @@ impl<'a> Runtime<'a> {
                             .get(i as usize)
                             .cloned()
                             .unwrap_or(Value::Unit),
-                        _ => return Err(err(Msg::IndexOnNonList(list.type_tag().into()), 0, 0)),
+                        _ => {
+                            return Err(err(
+                                Msg::IndexOnNonList(list.type_tag().into()),
+                                self.line_at(task),
+                                0,
+                            ))
+                        }
                     };
                     task.stack.push(item);
                 }
@@ -634,7 +665,7 @@ impl<'a> Runtime<'a> {
                     let idx = task.stack.pop().unwrap_or(Value::Int(0));
                     let list = task.stack.pop().unwrap_or(Value::Unit);
                     let Value::Int(i) = idx else {
-                        return Err(err(Msg::IndexNotInt, 0, 0));
+                        return Err(err(Msg::IndexNotInt, self.line_at(task), 0));
                     };
                     match list {
                         Value::List(items) => {
@@ -644,7 +675,11 @@ impl<'a> Runtime<'a> {
                             }
                         }
                         other => {
-                            return Err(err(Msg::IndexOnNonList(other.type_tag().into()), 0, 0))
+                            return Err(err(
+                                Msg::IndexOnNonList(other.type_tag().into()),
+                                self.line_at(task),
+                                0,
+                            ))
                         }
                     }
                     task.stack.push(Value::Unit);
@@ -653,11 +688,17 @@ impl<'a> Runtime<'a> {
                     let idx = task.stack.pop().unwrap_or(Value::Int(0));
                     let obj = task.stack.pop().unwrap_or(Value::Unit).deref();
                     let v = match (&obj, &idx) {
-                        (Value::List(items), Value::Int(i)) => items
-                            .borrow()
-                            .get(*i as usize)
-                            .cloned()
-                            .unwrap_or(Value::Unit),
+                        (Value::List(items), Value::Int(i)) => {
+                            let items = items.borrow();
+                            let len = items.len() as i64;
+                            items.get(*i as usize).cloned().ok_or_else(|| {
+                                err(
+                                    Msg::IndexOutOfRange { index: *i, len },
+                                    self.line_at(task),
+                                    0,
+                                )
+                            })?
+                        }
                         (Value::Dict(pairs), key) => pairs
                             .borrow()
                             .iter()
@@ -665,13 +706,24 @@ impl<'a> Runtime<'a> {
                             .map(|(_, v)| v.clone())
                             .unwrap_or(Value::Unit),
                         (Value::Tuple(items), Value::Int(i)) => {
-                            items.get(*i as usize).cloned().unwrap_or(Value::Unit)
+                            let len = items.len() as i64;
+                            items.get(*i as usize).cloned().ok_or_else(|| {
+                                err(
+                                    Msg::IndexOutOfRange { index: *i, len },
+                                    self.line_at(task),
+                                    0,
+                                )
+                            })?
                         }
                         (Value::List(_), _) | (Value::Tuple(_), _) => {
-                            return Err(err(Msg::IndexNotInt, 0, 0))
+                            return Err(err(Msg::IndexNotInt, self.line_at(task), 0))
                         }
                         other => {
-                            return Err(err(Msg::IndexOnNonList(other.0.type_tag().into()), 0, 0))
+                            return Err(err(
+                                Msg::IndexOnNonList(other.0.type_tag().into()),
+                                self.line_at(task),
+                                0,
+                            ))
                         }
                     };
                     task.stack.push(v);
@@ -704,7 +756,7 @@ impl<'a> Runtime<'a> {
                                     ty: other.type_tag().into(),
                                     field: field.to_string(),
                                 },
-                                0,
+                                self.line_at(task),
                                 0,
                             ))
                         }
@@ -726,7 +778,7 @@ impl<'a> Runtime<'a> {
                                         ty: tag.into(),
                                         field: field.to_string(),
                                     },
-                                    0,
+                                    self.line_at(task),
                                     0,
                                 ));
                             };
@@ -746,7 +798,7 @@ impl<'a> Runtime<'a> {
                                         ty: tag.into(),
                                         field: field.to_string(),
                                     },
-                                    0,
+                                    self.line_at(task),
                                     0,
                                 ));
                             };
@@ -803,43 +855,99 @@ impl<'a> Runtime<'a> {
                         Value::Str(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
-                            return self.str_method(&mut task.stack, recv, &method, &args[1..]);
+                            let line = self.line_at(task);
+                            return self.str_method(
+                                &mut task.stack,
+                                recv,
+                                &method,
+                                &args[1..],
+                                line,
+                            );
                         }
                         Value::Dict(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
-                            return self.dict_method(&mut task.stack, recv, &method, &args[1..]);
+                            let line = self.line_at(task);
+                            return self.dict_method(
+                                &mut task.stack,
+                                recv,
+                                &method,
+                                &args[1..],
+                                line,
+                            );
                         }
                         Value::Set(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
-                            return self.set_method(&mut task.stack, recv, &method, &args[1..]);
+                            let line = self.line_at(task);
+                            return self.set_method(
+                                &mut task.stack,
+                                recv,
+                                &method,
+                                &args[1..],
+                                line,
+                            );
                         }
                         Value::Tuple(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
-                            return self.tuple_method(&mut task.stack, recv, &method, &args[1..]);
+                            let line = self.line_at(task);
+                            return self.tuple_method(
+                                &mut task.stack,
+                                recv,
+                                &method,
+                                &args[1..],
+                                line,
+                            );
                         }
                         Value::None | Value::Some(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
-                            return self.option_method(&mut task.stack, recv, &method, &args[1..]);
+                            let line = self.line_at(task);
+                            return self.option_method(
+                                &mut task.stack,
+                                recv,
+                                &method,
+                                &args[1..],
+                                line,
+                            );
                         }
                         Value::Ok(_) | Value::Err(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
-                            return self.result_method(&mut task.stack, recv, &method, &args[1..]);
+                            let line = self.line_at(task);
+                            return self.result_method(
+                                &mut task.stack,
+                                recv,
+                                &method,
+                                &args[1..],
+                                line,
+                            );
                         }
                         Value::List(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
-                            return self.list_method(&mut task.stack, recv, &method, &args[1..]);
+                            let line = self.line_at(task);
+                            return self.list_method(
+                                &mut task.stack,
+                                recv,
+                                &method,
+                                &args[1..],
+                                line,
+                            );
                         }
                         Value::Chan(_) => {
                             let args = collect_args(&mut task.stack, argc)?;
                             let recv = args[0].deref();
-                            let blocked =
-                                self.chan_method(&mut task.stack, recv, &method, &args[1..], id)?;
+                            let line = self.line_at(task);
+                            let blocked = self.chan_method(
+                                &mut task.stack,
+                                recv,
+                                &method,
+                                &args[1..],
+                                id,
+                                line,
+                            )?;
                             if !blocked && method.as_ref() == "recv" {
                                 // Blocked recv: retry CallMethod after being woken
                                 // by re-executing it (args restored on the stack).
@@ -856,7 +964,7 @@ impl<'a> Runtime<'a> {
                                     ty: other.type_tag().into(),
                                     method: method.to_string(),
                                 },
-                                0,
+                                self.line_at(task),
                                 0,
                             ))
                         }
@@ -872,7 +980,7 @@ impl<'a> Runtime<'a> {
                                 ty: ty.clone(),
                                 method: method.to_string(),
                             },
-                            0,
+                            self.line_at(task),
                             0,
                         ));
                     };
@@ -900,14 +1008,14 @@ impl<'a> Runtime<'a> {
                         .collect::<Vec<_>>()
                         .join(" ");
                     writeln!(self.out, "{}", line)
-                        .map_err(|e| err(Msg::Io(e.to_string()), 0, 0))?;
+                        .map_err(|e| err(Msg::Io(e.to_string()), self.line_at(task), 0))?;
                     task.stack.push(Value::Unit);
                 }
                 Instr::BuiltinRange => {
                     let end = task.stack.pop().unwrap_or(Value::Int(0));
                     let start = task.stack.pop().unwrap_or(Value::Int(0));
                     let (Value::Int(s), Value::Int(e)) = (start, end) else {
-                        return Err(err(Msg::RangeNotInt, 0, 0));
+                        return Err(err(Msg::RangeNotInt, self.line_at(task), 0));
                     };
                     task.stack.push(Value::Range { start: s, end: e });
                 }
@@ -940,7 +1048,11 @@ impl<'a> Runtime<'a> {
                         Value::List(items) => IterState::List { items, idx: 0 },
                         Value::Chan(chan) => IterState::Chan { chan },
                         other => {
-                            return Err(err(Msg::ForNotSupported(other.type_tag().into()), 0, 0))
+                            return Err(err(
+                                Msg::ForNotSupported(other.type_tag().into()),
+                                self.line_at(task),
+                                0,
+                            ))
                         }
                     };
                     task.iters.push(iter);
@@ -1022,11 +1134,19 @@ impl<'a> Runtime<'a> {
                     let v = task.stack.pop().unwrap_or(Value::Unit);
                     let ch = task.stack.pop().unwrap_or(Value::Unit);
                     let Value::Chan(chan) = ch else {
-                        return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
+                        return Err(err(
+                            Msg::BadCall("not a channel".into()),
+                            self.line_at(task),
+                            0,
+                        ));
                     };
                     let mut c = chan.borrow_mut();
                     if c.closed {
-                        return Err(err(Msg::BadCall("send on closed channel".into()), 0, 0));
+                        return Err(err(
+                            Msg::BadCall("send on closed channel".into()),
+                            self.line_at(task),
+                            0,
+                        ));
                     }
                     if c.buf.len() < c.cap || c.cap == 0 {
                         if c.cap == 0 {
@@ -1054,7 +1174,11 @@ impl<'a> Runtime<'a> {
                 Instr::ChanRecv => {
                     let ch = task.stack.pop().unwrap_or(Value::Unit);
                     let Value::Chan(chan) = ch else {
-                        return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
+                        return Err(err(
+                            Msg::BadCall("not a channel".into()),
+                            self.line_at(task),
+                            0,
+                        ));
                     };
                     let mut c = chan.borrow_mut();
                     if let Some(v) = c.buf.pop_front() {
@@ -1095,7 +1219,11 @@ impl<'a> Runtime<'a> {
                 Instr::ChanClose => {
                     let ch = task.stack.pop().unwrap_or(Value::Unit);
                     let Value::Chan(chan) = ch else {
-                        return Err(err(Msg::BadCall("not a channel".into()), 0, 0));
+                        return Err(err(
+                            Msg::BadCall("not a channel".into()),
+                            self.line_at(task),
+                            0,
+                        ));
                     };
                     let mut c = chan.borrow_mut();
                     c.closed = true;
@@ -1109,7 +1237,7 @@ impl<'a> Runtime<'a> {
                 Instr::MakeChan(_) => {
                     let buf = task.stack.pop().unwrap_or(Value::Int(0));
                     let Value::Int(cap) = buf else {
-                        return Err(err(Msg::RangeNotInt, 0, 0));
+                        return Err(err(Msg::RangeNotInt, self.line_at(task), 0));
                     };
                     let chan = Rc::new(RefCell::new(Channel::new(cap.max(0) as usize)));
                     self.channels.push(chan.clone());
@@ -1163,6 +1291,23 @@ impl<'a> Runtime<'a> {
                     let v = task.stack.pop().unwrap_or(Value::Bool(false));
                     task.stack.push(Value::Bool(!truthy(&v)));
                 }
+                Instr::Neg => {
+                    let v = task.stack.pop().unwrap_or(Value::Int(0));
+                    match v.deref() {
+                        Value::Int(n) => task.stack.push(Value::Int(n.wrapping_neg())),
+                        Value::Float(f) => task.stack.push(Value::Float(-f)),
+                        other => {
+                            return Err(err(
+                                Msg::OpTypeMismatch {
+                                    op: "-".into(),
+                                    actual: other.type_tag().into(),
+                                },
+                                self.line_at(task),
+                                0,
+                            ))
+                        }
+                    }
+                }
                 Instr::Binary(op) => {
                     let r = task.stack.pop().unwrap_or(Value::Unit);
                     let l = task.stack.pop().unwrap_or(Value::Unit);
@@ -1179,19 +1324,19 @@ impl<'a> Runtime<'a> {
                         }
                         (BinOp::Div, Value::Int(a), Value::Int(b)) => {
                             if *b == 0 {
-                                return Err(err(Msg::DivByZero, 0, 0));
+                                return Err(err(Msg::DivByZero, self.line_at(task), 0));
                             }
                             Value::Int(a / b)
                         }
                         (BinOp::Mod, Value::Int(a), Value::Int(b)) => {
                             if *b == 0 {
-                                return Err(err(Msg::ModByZero, 0, 0));
+                                return Err(err(Msg::ModByZero, self.line_at(task), 0));
                             }
                             Value::Int(a % b)
                         }
                         (BinOp::And, _, _) => Value::Bool(truthy(&l) && truthy(&r)),
                         (BinOp::Or, _, _) => Value::Bool(truthy(&l) || truthy(&r)),
-                        _ => binary(*op, &l, &r).map_err(|m| err(m, 0, 0))?,
+                        _ => binary(*op, &l, &r).map_err(|m| err(m, self.line_at(task), 0))?,
                     };
                     task.stack.push(v);
                 }
@@ -1258,7 +1403,7 @@ impl<'a> Runtime<'a> {
                 Instr::Assert => {
                     let v = task.stack.pop().unwrap_or(Value::Bool(false));
                     if !truthy(&v) {
-                        return Err(err(Msg::AssertFailed, 0, 0));
+                        return Err(err(Msg::AssertFailed, self.line_at(task), 0));
                     }
                 }
                 Instr::Builtin(id) => {
@@ -1275,6 +1420,7 @@ impl<'a> Runtime<'a> {
         recv: Value,
         method: &str,
         args: &[Value],
+        line: usize,
     ) -> Result<bool, VmError> {
         let Value::Str(s) = recv else {
             return Err(err(
@@ -1282,7 +1428,7 @@ impl<'a> Runtime<'a> {
                     ty: recv.type_tag().into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             ));
         };
@@ -1293,11 +1439,11 @@ impl<'a> Runtime<'a> {
             }
             "sub" => {
                 let Value::Int(start) = args.first().cloned().unwrap_or(Value::Int(0)) else {
-                    return Err(err(Msg::IndexNotInt, 0, 0));
+                    return Err(err(Msg::IndexNotInt, line, 0));
                 };
                 let Value::Int(end) = args.get(1).cloned().unwrap_or(Value::Int(s.len() as i64))
                 else {
-                    return Err(err(Msg::IndexNotInt, 0, 0));
+                    return Err(err(Msg::IndexNotInt, line, 0));
                 };
                 let start = start.max(0).min(s.len() as i64) as usize;
                 let end = end.max(0).min(s.len() as i64) as usize;
@@ -1313,7 +1459,7 @@ impl<'a> Runtime<'a> {
                 else {
                     return Err(err(
                         Msg::BadCall("split needs a str separator".into()),
-                        0,
+                        line,
                         0,
                     ));
                 };
@@ -1326,7 +1472,7 @@ impl<'a> Runtime<'a> {
             }
             "join" => {
                 let Value::List(items) = args.first().cloned().unwrap_or(Value::Unit) else {
-                    return Err(err(Msg::BadCall("join needs a List[str]".into()), 0, 0));
+                    return Err(err(Msg::BadCall("join needs a List[str]".into()), line, 0));
                 };
                 let parts: Vec<String> = items
                     .borrow()
@@ -1341,21 +1487,21 @@ impl<'a> Runtime<'a> {
             }
             "contains" => {
                 let Value::Str(sub) = args.first().cloned().unwrap_or(Value::Str("".into())) else {
-                    return Err(err(Msg::BadCall("contains needs a str".into()), 0, 0));
+                    return Err(err(Msg::BadCall("contains needs a str".into()), line, 0));
                 };
                 stack.push(Value::Bool(s.contains(sub.as_ref())));
                 Ok(true)
             }
             "starts_with" => {
                 let Value::Str(sub) = args.first().cloned().unwrap_or(Value::Str("".into())) else {
-                    return Err(err(Msg::BadCall("starts_with needs a str".into()), 0, 0));
+                    return Err(err(Msg::BadCall("starts_with needs a str".into()), line, 0));
                 };
                 stack.push(Value::Bool(s.starts_with(sub.as_ref())));
                 Ok(true)
             }
             "ends_with" => {
                 let Value::Str(sub) = args.first().cloned().unwrap_or(Value::Str("".into())) else {
-                    return Err(err(Msg::BadCall("ends_with needs a str".into()), 0, 0));
+                    return Err(err(Msg::BadCall("ends_with needs a str".into()), line, 0));
                 };
                 stack.push(Value::Bool(s.ends_with(sub.as_ref())));
                 Ok(true)
@@ -1389,7 +1535,7 @@ impl<'a> Runtime<'a> {
                     ty: "str".into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             )),
         }
@@ -1401,6 +1547,7 @@ impl<'a> Runtime<'a> {
         recv: Value,
         method: &str,
         args: &[Value],
+        line: usize,
     ) -> Result<bool, VmError> {
         let Value::Dict(pairs) = recv else {
             return Err(err(
@@ -1408,7 +1555,7 @@ impl<'a> Runtime<'a> {
                     ty: recv.type_tag().into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             ));
         };
@@ -1467,7 +1614,7 @@ impl<'a> Runtime<'a> {
                     ty: "Dict".into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             )),
         }
@@ -1479,6 +1626,7 @@ impl<'a> Runtime<'a> {
         recv: Value,
         method: &str,
         args: &[Value],
+        line: usize,
     ) -> Result<bool, VmError> {
         let Value::Set(items) = recv else {
             return Err(err(
@@ -1486,7 +1634,7 @@ impl<'a> Runtime<'a> {
                     ty: recv.type_tag().into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             ));
         };
@@ -1520,7 +1668,7 @@ impl<'a> Runtime<'a> {
                     ty: "Set".into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             )),
         }
@@ -1532,6 +1680,7 @@ impl<'a> Runtime<'a> {
         recv: Value,
         method: &str,
         _args: &[Value],
+        line: usize,
     ) -> Result<bool, VmError> {
         let Value::Tuple(items) = recv else {
             return Err(err(
@@ -1539,7 +1688,7 @@ impl<'a> Runtime<'a> {
                     ty: recv.type_tag().into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             ));
         };
@@ -1553,7 +1702,7 @@ impl<'a> Runtime<'a> {
                     ty: "tuple".into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             )),
         }
@@ -1565,6 +1714,7 @@ impl<'a> Runtime<'a> {
         recv: Value,
         method: &str,
         _args: &[Value],
+        line: usize,
     ) -> Result<bool, VmError> {
         match (&recv, method) {
             (Value::None, "is_none") => {
@@ -1587,13 +1737,13 @@ impl<'a> Runtime<'a> {
                 stack.push((**v).clone());
                 Ok(true)
             }
-            (Value::None, "unwrap") => Err(err(Msg::UnwrapNone, 0, 0)),
+            (Value::None, "unwrap") => Err(err(Msg::UnwrapNone, line, 0)),
             _ => Err(err(
                 Msg::UnknownMethod {
                     ty: "Option".into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             )),
         }
@@ -1605,6 +1755,7 @@ impl<'a> Runtime<'a> {
         recv: Value,
         method: &str,
         _args: &[Value],
+        line: usize,
     ) -> Result<bool, VmError> {
         match (&recv, method) {
             (Value::Ok(_), "is_ok") => {
@@ -1627,18 +1778,20 @@ impl<'a> Runtime<'a> {
                 stack.push((**v).clone());
                 Ok(true)
             }
-            (Value::Err(v), "unwrap") => Err(err(Msg::UnwrapErr(v.display()), 0, 0)),
+            (Value::Err(v), "unwrap") => Err(err(Msg::UnwrapErr(v.display()), line, 0)),
             (Value::Err(v), "unwrap_err") => {
                 stack.push((**v).clone());
                 Ok(true)
             }
-            (Value::Ok(_), "unwrap_err") => Err(err(Msg::BadCall("unwrap_err on Ok".into()), 0, 0)),
+            (Value::Ok(_), "unwrap_err") => {
+                Err(err(Msg::BadCall("unwrap_err on Ok".into()), line, 0))
+            }
             _ => Err(err(
                 Msg::UnknownMethod {
                     ty: "Result".into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             )),
         }
@@ -1655,7 +1808,7 @@ impl<'a> Runtime<'a> {
                 let Value::Str(p) = path else {
                     return Err(err(
                         Msg::BadCall("read_to_str needs a str path".into()),
-                        0,
+                        self.line_at(task),
                         0,
                     ));
                 };
@@ -1670,7 +1823,11 @@ impl<'a> Runtime<'a> {
                 let content = pop(task);
                 let path = pop(task);
                 let Value::Str(p) = path else {
-                    return Err(err(Msg::BadCall("write needs a str path".into()), 0, 0));
+                    return Err(err(
+                        Msg::BadCall("write needs a str path".into()),
+                        self.line_at(task),
+                        0,
+                    ));
                 };
                 let v = match content {
                     Value::Str(c) => std::fs::write(p.as_ref(), c.as_ref()),
@@ -1680,7 +1837,7 @@ impl<'a> Runtime<'a> {
                                 "write content must be a str, got {}",
                                 other.type_tag()
                             )),
-                            0,
+                            self.line_at(task),
                             0,
                         ))
                     }
@@ -1702,7 +1859,11 @@ impl<'a> Runtime<'a> {
                 // sleep(ms)
                 let v = pop(task);
                 let Value::Int(ms) = v else {
-                    return Err(err(Msg::BadCall("sleep needs an int".into()), 0, 0));
+                    return Err(err(
+                        Msg::BadCall("sleep needs an int".into()),
+                        self.line_at(task),
+                        0,
+                    ));
                 };
                 std::thread::sleep(std::time::Duration::from_millis(ms.max(0) as u64));
                 task.stack.push(Value::Unit);
@@ -1719,7 +1880,7 @@ impl<'a> Runtime<'a> {
                                 "abs needs int or float, got {}",
                                 other.type_tag()
                             )),
-                            0,
+                            self.line_at(task),
                             0,
                         ))
                     }
@@ -1734,7 +1895,7 @@ impl<'a> Runtime<'a> {
                     other => {
                         return Err(err(
                             Msg::BadCall(format!("math fn needs float, got {}", other.type_tag())),
-                            0,
+                            self.line_at(task),
                             0,
                         ))
                     }
@@ -1755,7 +1916,7 @@ impl<'a> Runtime<'a> {
                     other => {
                         return Err(err(
                             Msg::BadCall(format!("sqrt needs float, got {}", other.type_tag())),
-                            0,
+                            self.line_at(task),
                             0,
                         ))
                     }
@@ -1772,7 +1933,7 @@ impl<'a> Runtime<'a> {
                         Value::Int(n) => Ok(n as f64),
                         other => Err(err(
                             Msg::BadCall(format!("pow needs floats, got {}", other.type_tag())),
-                            0,
+                            self.line_at(task),
                             0,
                         )),
                     }
@@ -1787,7 +1948,7 @@ impl<'a> Runtime<'a> {
                     None => {
                         return Err(err(
                             Msg::BadCall("json_encode: value is not JSON-encodable".into()),
-                            0,
+                            self.line_at(task),
                             0,
                         ))
                     }
@@ -1797,7 +1958,11 @@ impl<'a> Runtime<'a> {
                 // json_decode(s) -> Result[Json, str]
                 let s = pop(task);
                 let Value::Str(s) = s else {
-                    return Err(err(Msg::BadCall("json_decode needs a str".into()), 0, 0));
+                    return Err(err(
+                        Msg::BadCall("json_decode needs a str".into()),
+                        self.line_at(task),
+                        0,
+                    ));
                 };
                 match serde_json::from_str::<serde_json::Value>(s.as_ref()) {
                     Ok(j) => task.stack.push(Value::Ok(Box::new(json_to_value(&j)))),
@@ -1807,7 +1972,7 @@ impl<'a> Runtime<'a> {
                 }
             }
             _ => {
-                return Err(err(Msg::InternalFnIndex, 0, 0));
+                return Err(err(Msg::InternalFnIndex, self.line_at(task), 0));
             }
         }
         Ok(())
@@ -1819,6 +1984,7 @@ impl<'a> Runtime<'a> {
         recv: Value,
         method: &str,
         args: &[Value],
+        line: usize,
     ) -> Result<bool, VmError> {
         let Value::List(items) = recv else {
             return Err(err(
@@ -1826,7 +1992,7 @@ impl<'a> Runtime<'a> {
                     ty: recv.type_tag().into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             ));
         };
@@ -1848,7 +2014,7 @@ impl<'a> Runtime<'a> {
             }
             "get" => {
                 let Value::Int(i) = args.first().cloned().unwrap_or(Value::Int(0)) else {
-                    return Err(err(Msg::IndexNotInt, 0, 0));
+                    return Err(err(Msg::IndexNotInt, line, 0));
                 };
                 stack.push(
                     items
@@ -1861,7 +2027,7 @@ impl<'a> Runtime<'a> {
             }
             "set" => {
                 let Value::Int(i) = args.first().cloned().unwrap_or(Value::Int(0)) else {
-                    return Err(err(Msg::IndexNotInt, 0, 0));
+                    return Err(err(Msg::IndexNotInt, line, 0));
                 };
                 let v = args.get(1).cloned().unwrap_or(Value::Unit);
                 let mut items = items.borrow_mut();
@@ -1876,7 +2042,7 @@ impl<'a> Runtime<'a> {
                     ty: "List".into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             )),
         }
@@ -1889,6 +2055,7 @@ impl<'a> Runtime<'a> {
         method: &str,
         args: &[Value],
         task_id: usize,
+        line: usize,
     ) -> Result<bool, VmError> {
         let Value::Chan(chan) = recv else {
             return Err(err(
@@ -1896,7 +2063,7 @@ impl<'a> Runtime<'a> {
                     ty: recv.type_tag().into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             ));
         };
@@ -1905,7 +2072,7 @@ impl<'a> Runtime<'a> {
                 let v = args.first().cloned().unwrap_or(Value::Unit);
                 let mut c = chan.borrow_mut();
                 if c.closed {
-                    return Err(err(Msg::BadCall("send on closed channel".into()), 0, 0));
+                    return Err(err(Msg::BadCall("send on closed channel".into()), line, 0));
                 }
                 if c.buf.len() < c.cap || c.cap == 0 {
                     // Buffered: push. Unbuffered: rendezvous into the buffer.
@@ -1981,7 +2148,7 @@ impl<'a> Runtime<'a> {
                     ty: "Chan".into(),
                     method: method.into(),
                 },
-                0,
+                line,
                 0,
             )),
         }
@@ -2148,6 +2315,13 @@ fn cmp_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, Msg> {
         (Value::None, Value::None) => match op {
             Eq => true,
             Ne => false,
+            _ => return Err(Msg::CmpMismatch),
+        },
+        // `Json` values are native values at runtime; comparing any of
+        // them with `None` is supported (GOALS D13: Json 与 None 可比较).
+        (Value::None, _) | (_, Value::None) => match op {
+            Eq => false,
+            Ne => true,
             _ => return Err(Msg::CmpMismatch),
         },
         _ => return Err(Msg::CmpMismatch),

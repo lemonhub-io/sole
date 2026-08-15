@@ -493,6 +493,23 @@ print(-3 + 4)
     }
 
     #[test]
+    fn runtime_errors_carry_line_numbers() {
+        let err = run("let x = 1\nprint(5 / 0)\n").unwrap_err();
+        assert!(err.contains("2:0:"), "err: {err}");
+        let err = run("let o: Option[int] = None\nprint(o.unwrap())\n").unwrap_err();
+        assert!(err.contains("2:0:"), "err: {err}");
+        let err = run("let r: Result[int, str] = Err(\"x\")\nprint(r.unwrap())\n").unwrap_err();
+        assert!(err.contains("2:0:"), "err: {err}");
+        let err = run("let a = [1, 2]\nprint(a[9])\n").unwrap_err();
+        assert!(err.contains("2:0:"), "err: {err}");
+        assert!(err.contains("[E0223]"), "err: {err}");
+        let err = run("let a = [1, 2]\nprint(a.len())\nassert 1 == 2\n").unwrap_err();
+        assert!(err.contains("3:0:"), "err: {err}");
+        let err = run("print([1, 2][9])\n").unwrap_err();
+        assert!(err.contains("1:0:"), "err: {err}");
+    }
+
+    #[test]
     fn generic_function_end_to_end() {
         let src = r#"
 fn max[T: Comparable](a: T, b: T) -> T:

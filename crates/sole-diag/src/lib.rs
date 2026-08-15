@@ -154,6 +154,10 @@ pub enum Msg {
     EmptyListNoType,
     IndexOnNonList(String),
     IndexNotInt,
+    IndexOutOfRange {
+        index: i64,
+        len: i64,
+    },
     DictKeyMismatch {
         expected: String,
         actual: String,
@@ -239,6 +243,7 @@ impl Msg {
             Msg::EmptyListNoType => "E0313",
             Msg::IndexOnNonList(_) => "E0314",
             Msg::IndexNotInt => "E0315",
+            Msg::IndexOutOfRange { .. } => "E0223",
             Msg::DictKeyMismatch { .. } => "E0316",
             Msg::SetElemMismatch { .. } => "E0317",
             Msg::EmptyDictNoType => "E0318",
@@ -414,6 +419,9 @@ impl Msg {
             }
             Msg::IndexOnNonList(ty) => format!("cannot index a value of type `{}`", ty),
             Msg::IndexNotInt => "list index must be an int".into(),
+            Msg::IndexOutOfRange { index, len } => {
+                format!("index {} out of range (len {})", index, len)
+            }
             Msg::UseAfterMove(name) => {
                 format!(
                     "use of moved value `{}` (move it back or borrow instead)",
@@ -566,6 +574,9 @@ impl Msg {
             Msg::EmptyListNoType => "空列表字面量需要类型标注(如 `let xs: List[int] = []`)".into(),
             Msg::IndexOnNonList(ty) => format!("不能对类型 `{}` 的值做下标访问", ty),
             Msg::IndexNotInt => "列表下标必须是 int".into(),
+            Msg::IndexOutOfRange { index, len } => {
+                format!("下标 {} 越界(长度 {})", index, len)
+            }
             Msg::UseAfterMove(name) => {
                 format!("使用了已移动的值 `{}`(改为移动回来或用借用)", name)
             }

@@ -41,7 +41,8 @@
   通道 `Chan[T]`(`send`/`recv`/`close`、缓冲/无缓冲、`for v in ch` 接收循环、`yield`)
 - formatter:官方唯一格式(类 gofmt),`sole fmt <file|dir>` / `sole fmt --check`
 - LSP server:`sole lsp`(full-sync 诊断、跳转定义、补全;复用类型检查器双语渲染)
-- 可变性检查(`let mut` 才能重新赋值)、错误定位(词法/解析/类型检查/求值错误均带行列)
+- 可变性检查(`let mut` 才能重新赋值)、错误定位(词法/解析/类型检查错误带行列,
+  求值错误带行号;索引越界报 E0223)
 - 双语错误信息(`--lang en|zh` 或 `SOLE_LANG` 环境变量)
 
 ## 快速开始(在任意有 Rust 的机器上)
@@ -91,6 +92,7 @@ cargo test --workspace
 - 整数除法暂为截断;truthiness 暂为 Python 风格(暂定)
 - 借用检查为最小规则集(变量级 + 字段级借用、借用传播);细粒度区域与索引借用未实现
 - 未实现: `select` 多路复用、`Shared[T]` / `Mutex`(GOALS §7.5)、自定义泛型类型/接口
-  (D9 明确不做)
+  (D9 明确不做)、自定义类型的 `for` 迭代(仅内建容器)
 - `ref` / `mut ref` 有完整借用检查,但无运行时借用逃逸检测(由静态检查保证)
 - formatter 丢弃注释(词法器不保留);LSP 的 hover 与增量同步未实现(D14 诚实记录)
+- 完整技术债务清单: [docs/DEBT.md](docs/DEBT.md)

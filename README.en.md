@@ -57,7 +57,8 @@ Currently supported:
 - LSP server: `sole lsp` (full-sync diagnostics, go-to-definition,
   completion; reuses the type checker with bilingual rendering)
 - Mutability checking (`let mut` is required for reassignment); errors are
-  located with line/column in lexing, parsing, type checking, and evaluation
+  located with line/column in lexing, parsing, and type checking; runtime
+  errors carry the line number (index out of range is E0223)
 - Bilingual error messages (`--lang en|zh` or the `SOLE_LANG` env var)
 
 ## Quick Start (on any machine with Rust)
@@ -112,8 +113,10 @@ cargo test --workspace
   borrows, borrow propagation); fine-grained regions and index borrows are
   not implemented
 - Not implemented: `select` multiplexing, `Shared[T]` / `Mutex` (GOALS §7.5),
-  user-defined generic types/interfaces (explicitly excluded by D9)
+  user-defined generic types/interfaces (explicitly excluded by D9),
+  `for` iteration over custom types (builtin containers only)
 - `ref` / `mut ref` have full borrow checking, but no runtime borrow-escape
   detection (guaranteed statically)
 - The formatter discards comments (the lexer does not keep them); LSP hover
   and incremental sync are not implemented (honestly recorded in D14)
+- Full technical debt inventory: [docs/DEBT.md](docs/DEBT.md)
