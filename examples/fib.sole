@@ -1,4 +1,3 @@
-# 斐波那契(M1 参考实现)
 fn fib(n: int) -> int:
     if n < 2:
         return n

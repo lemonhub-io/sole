@@ -10,4 +10,5 @@ fn sum_loop(n: int) -> int:
     return total
 
 print(fib(28))
+
 print(sum_loop(1000000))

@@ -21,3 +21,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Sole fmt --check (examples + bench)
+        run: |
+          cargo build --release -p sole
+          ./target/release/sole fmt --check examples bench

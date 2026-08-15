@@ -1,4 +1,3 @@
-# 集合与借用(M2 参考实现)
 fn sum(xs: ref List[int]) -> int:
     let mut total = 0
     for x in ref xs:
@@ -6,9 +5,14 @@ fn sum(xs: ref List[int]) -> int:
     return total
 
 let xs: List[int] = [1, 2, 3, 4, 5]
+
 print(sum(xs))
+
 print(xs.len())
+
 xs.push(6)
+
 print(xs.len())
+
 for x in ref xs:
     print(x)

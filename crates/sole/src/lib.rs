@@ -3,6 +3,7 @@
 //! Semantics follow docs/GOALS.md; see the README for known simplifications.
 
 pub mod compiler;
+pub mod fmt;
 pub mod typecheck;
 pub mod vm;
 
@@ -727,5 +728,100 @@ print(arr[2] == None)
     fn missing_module_is_error() {
         let err = load_program("import definitely_not_a_module_xyz\n", None).unwrap_err();
         assert!(err.contains("cannot find module"), "err: {err}");
+    }
+}
+
+#[cfg(test)]
+mod fmt_tests {
+    use super::*;
+
+    fn fmt(src: &str) -> String {
+        crate::fmt::format_source(src).unwrap()
+    }
+
+    fn run_fmt(src: &str) -> Result<String, String> {
+        let formatted = fmt(src);
+        let program = load_program(&formatted, None).map_err(|e| e.to_string())?;
+        typecheck::check(&program).map_err(|e| e.to_string())?;
+        let compiled = compiler::compile(&program).map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        let mut rt = vm::Runtime::new(Rc::new(compiled), &mut buf);
+        rt.run().map_err(|e| e.to_string())?;
+        String::from_utf8(buf).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn fmt_is_idempotent() {
+        let cases = [
+            "fn f(a:int,b:int)->int:\n if a>b:\n  return a\n return b\nprint(f(1,2))\n",
+            "let x:List[int]=[1,2,3]\nfor i in ref x:\n print(i)\n",
+            "struct S:\n x:int\n y:float\n",
+            "test t:\n assert 1==1\n",
+            "import a\nfrom b import c\n",
+            "let d:Dict[str,int]={\"k\":1}\nprint(d[\"k\"])\n",
+            "fn g[T: Comparable](a:T,b:T)->T:\n return a\n",
+        ];
+        for src in cases {
+            let once = fmt(src);
+            let twice = fmt(&once);
+            assert_eq!(once, twice, "not idempotent for: {src:?}");
+            // formatted output must re-parse
+            assert!(sole_parser::parse(&once).is_ok(), "unparseable: {once}");
+        }
+    }
+
+    #[test]
+    fn fmt_preserves_parentheses_semantics() {
+        // Left assoc: no parens needed on the left, needed on the right.
+        assert_eq!(fmt("print((1 + 2) * 3)\n"), "print((1 + 2) * 3)\n");
+        assert_eq!(fmt("print(1 - (2 - 3))\n"), "print(1 - (2 - 3))\n");
+        assert_eq!(fmt("print(1 - 2 - 3)\n"), "print(1 - 2 - 3)\n");
+        // Precedence: add inside mul stays unparenthesized.
+        assert_eq!(fmt("print(1 + 2 * 3)\n"), "print(1 + 2 * 3)\n");
+        assert_eq!(fmt("print((1 + 2) * 3)\n"), "print((1 + 2) * 3)\n");
+    }
+
+    #[test]
+    fn fmt_preserves_semantics_end_to_end() {
+        let cases = [
+            "print(1 + 2 * 3)\n",
+            "print((1 + 2) * 3)\n",
+            "print(1 - (2 - 3))\n",
+            "let s = \"a\\\"b\\\\c\\nd\"\nprint(s)\n",
+            "let f = 1.0\nprint(f)\n",
+            "fn f(x:int)->int:\n return x\nprint(f(1))\n",
+            "let d: Dict[str, int] = {\"k\": 1}\nprint(d.get(\"k\").unwrap())\n",
+        ];
+        for src in cases {
+            let direct = run_fmt(src).unwrap();
+            let formatted = fmt(src);
+            let via_fmt = run_fmt(&formatted).unwrap();
+            assert_eq!(direct, via_fmt, "semantics changed for {src:?}");
+        }
+    }
+
+    fn examples_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples")
+    }
+
+    #[test]
+    fn fmt_examples_are_semantics_preserving() {
+        for name in ["hello", "fib", "list", "borrow", "shapes", "phase0"] {
+            let path = examples_dir().join(format!("{}.sole", name));
+            let src = std::fs::read_to_string(&path).unwrap();
+            let direct = run_fmt(&src).unwrap();
+            let via_fmt = run_fmt(&fmt(&src)).unwrap();
+            assert_eq!(direct, via_fmt, "example {name} changed semantics");
+        }
+    }
+
+    #[test]
+    fn fmt_all_examples_is_idempotent() {
+        for entry in std::fs::read_dir(examples_dir()).unwrap().flatten() {
+            let src = std::fs::read_to_string(entry.path()).unwrap();
+            let once = fmt(&src);
+            let twice = fmt(&once);
+            assert_eq!(once, twice, "{} not idempotent", entry.path().display());
+        }
     }
 }
