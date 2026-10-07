@@ -103,6 +103,11 @@ pub enum Msg {
         index: usize,
         len: usize,
     },
+    /// Runtime counterpart of the static `IndexNotInt` check (E0315):
+    /// the VM reports it when a non-int index reaches evaluation.
+    IndexNotIntRt,
+    /// Runtime counterpart of the static `IndexOnNonList` check (E0314).
+    IndexOnNonListRt(String),
     // Type checker (E03xx)
     LetTypeMismatch {
         name: String,
@@ -228,6 +233,8 @@ impl Msg {
             Msg::UnwrapErr(_) => "E0220",
             Msg::AssertFailed => "E0221",
             Msg::TupleIndexOutOfRange { .. } => "E0222",
+            Msg::IndexNotIntRt => "E0224",
+            Msg::IndexOnNonListRt(_) => "E0225",
             Msg::LetTypeMismatch { .. } => "E0301",
             Msg::AssignTypeMismatch { .. } => "E0302",
             Msg::ArgTypeMismatch { .. } => "E0303",
@@ -333,6 +340,8 @@ impl Msg {
                     index, len
                 )
             }
+            Msg::IndexNotIntRt => "index must be an int".into(),
+            Msg::IndexOnNonListRt(ty) => format!("cannot index a value of type `{}`", ty),
             Msg::DictKeyMismatch { expected, actual } => format!(
                 "dict key type mismatch: expected `{}`, got `{}`",
                 expected, actual
@@ -502,6 +511,8 @@ impl Msg {
             Msg::TupleIndexOutOfRange { index, len } => {
                 format!("元组索引 {} 越界(元组有 {} 个元素)", index, len)
             }
+            Msg::IndexNotIntRt => "下标必须是 int".into(),
+            Msg::IndexOnNonListRt(ty) => format!("不能对类型 `{}` 的值做下标访问", ty),
             Msg::DictKeyMismatch { expected, actual } => {
                 format!("字典键类型不匹配: 期望 `{}`,实际 `{}`", expected, actual)
             }

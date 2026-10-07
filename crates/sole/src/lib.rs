@@ -28,10 +28,15 @@ pub fn run_source(source: &str) -> Result<(), String> {
 
 /// Runs a `.sole` file, resolving `import` relative to its directory.
 pub fn run_file(path: &str) -> Result<(), String> {
+    run_file_with_args(path, &[])
+}
+
+/// Like `run_file` but exposes `script_args` to the program via `args()`.
+pub fn run_file_with_args(path: &str, script_args: &[String]) -> Result<(), String> {
     let source =
         std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
     let dir = Path::new(path).parent().map(|p| p.to_path_buf());
-    run_source_at(&source, dir.as_deref(), &mut std::io::stdout())
+    run_source_at_args(&source, dir.as_deref(), script_args, &mut std::io::stdout())
 }
 
 /// Loads a program and all its `import`ed modules (relative to
@@ -155,7 +160,7 @@ fn rewrite_module_prefixes(items: Vec<Item>, modules: &HashSet<String>) -> Vec<I
                 if let Some(ElseBranch::If(s)) = else_block {
                     rewrite_stmt(s, modules);
                 }
-                if let Some(ElseBranch::Block(b)) = else_block {
+                if let Some(ElseBranch::Block(b, _)) = else_block {
                     rewrite_block(b, modules);
                 }
             }
@@ -224,10 +229,21 @@ pub fn run_source_at(
     base_dir: Option<&Path>,
     out: &mut dyn std::io::Write,
 ) -> Result<(), String> {
+    run_source_at_args(source, base_dir, &[], out)
+}
+
+/// Like `run_source_at` but exposes `script_args` via `args()`.
+pub fn run_source_at_args(
+    source: &str,
+    base_dir: Option<&Path>,
+    script_args: &[String],
+    out: &mut dyn std::io::Write,
+) -> Result<(), String> {
     let program = load_program(source, base_dir)?;
     typecheck::check(&program).map_err(|e| e.to_string())?;
     let compiled = compiler::compile(&program).map_err(|e| e.to_string())?;
     let mut rt = vm::Runtime::new(Rc::new(compiled), out);
+    rt.args = script_args.to_vec();
     rt.run().map_err(|e| e.to_string())
 }
 
@@ -495,18 +511,18 @@ print(-3 + 4)
     #[test]
     fn runtime_errors_carry_line_numbers() {
         let err = run("let x = 1\nprint(5 / 0)\n").unwrap_err();
-        assert!(err.contains("2:0:"), "err: {err}");
+        assert!(err.contains("2:9:"), "err: {err}");
         let err = run("let o: Option[int] = None\nprint(o.unwrap())\n").unwrap_err();
-        assert!(err.contains("2:0:"), "err: {err}");
+        assert!(err.contains("2:15:"), "err: {err}");
         let err = run("let r: Result[int, str] = Err(\"x\")\nprint(r.unwrap())\n").unwrap_err();
-        assert!(err.contains("2:0:"), "err: {err}");
+        assert!(err.contains("2:15:"), "err: {err}");
         let err = run("let a = [1, 2]\nprint(a[9])\n").unwrap_err();
-        assert!(err.contains("2:0:"), "err: {err}");
+        assert!(err.contains("2:8:"), "err: {err}");
         assert!(err.contains("[E0223]"), "err: {err}");
         let err = run("let a = [1, 2]\nprint(a.len())\nassert 1 == 2\n").unwrap_err();
-        assert!(err.contains("3:0:"), "err: {err}");
+        assert!(err.contains("3:1:"), "err: {err}");
         let err = run("print([1, 2][9])\n").unwrap_err();
-        assert!(err.contains("1:0:"), "err: {err}");
+        assert!(err.contains("1:13:"), "err: {err}");
     }
 
     #[test]
@@ -620,6 +636,123 @@ print("1.5".to_float().unwrap())
     fn to_str_method() {
         let src = "print((42).to_str())\nprint(\"x\".to_str())\n";
         assert_eq!(run(src).unwrap(), "42\nx\n");
+    }
+}
+
+#[cfg(test)]
+mod bigint_tests {
+    use super::*;
+
+    fn run(src: &str) -> Result<String, String> {
+        let program = parse(src).map_err(|e| e.to_string())?;
+        typecheck::check(&program).map_err(|e| e.to_string())?;
+        let compiled = compiler::compile(&program).map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        let mut rt = vm::Runtime::new(Rc::new(compiled), &mut buf);
+        rt.run().map_err(|e| e.to_string())?;
+        String::from_utf8(buf).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn int_literals_are_arbitrary_precision() {
+        // Beyond i64 the literal used to be a lexer error.
+        let src = "print(99999999999999999999)\nprint(18446744073709551615)\n";
+        assert_eq!(
+            run(src).unwrap(),
+            "99999999999999999999\n18446744073709551615\n"
+        );
+    }
+
+    #[test]
+    fn arithmetic_promotes_on_overflow() {
+        let src = r#"
+print(9223372036854775807 + 1)
+print(2 * 9223372036854775807)
+print(-9223372036854775808 - 1)
+print(1000000000000000000 * 1000000000000000000 % 7)
+"#;
+        assert_eq!(
+            run(src).unwrap(),
+            "9223372036854775808\n18446744073709551614\n-9223372036854775809\n1\n"
+        );
+    }
+
+    #[test]
+    fn big_values_demote_back_to_small() {
+        // `from_big` keeps the representation canonical: values that fit
+        // again compare/hash equal to `Int`.
+        let src = r#"
+let x = 9223372036854775807 + 1
+print(x - 1)
+print(x - 1 == 9223372036854775807)
+print(x / -1)
+"#;
+        assert_eq!(
+            run(src).unwrap(),
+            "9223372036854775807\ntrue\n-9223372036854775808\n"
+        );
+    }
+
+    #[test]
+    fn big_int_comparisons() {
+        let src = r#"
+let big = 9223372036854775807 + 1
+print(big == 9223372036854775808)
+print(big > 9223372036854775807)
+print(9223372036854775808 > 99999999999999999999)
+"#;
+        assert_eq!(run(src).unwrap(), "true\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn big_ints_in_collections_and_strings() {
+        let src = r#"
+let d = {"k": 99999999999999999999}
+print(d["k"] + 1)
+print("123456789012345678901234567890".to_int().unwrap() * 2)
+let s = {9223372036854775808, 9223372036854775808}
+print(s.len())
+"#;
+        assert_eq!(
+            run(src).unwrap(),
+            "100000000000000000000\n246913578024691357802469135780\n1\n"
+        );
+    }
+
+    #[test]
+    fn big_int_json_roundtrip() {
+        // `arbitrary_precision` keeps digits exact in both directions.
+        let src = r#"
+print(json_encode({"big": 99999999999999999999}))
+let n = json_decode("99999999999999999999").unwrap()
+print(n.to_str())
+"#;
+        assert_eq!(
+            run(src).unwrap(),
+            "{\"big\":99999999999999999999}\n99999999999999999999\n"
+        );
+    }
+
+    #[test]
+    fn floor_of_huge_float_is_exact() {
+        assert_eq!(
+            run("print(floor(1e30))\n").unwrap(),
+            "1000000000000000019884624838656\n"
+        );
+    }
+
+    #[test]
+    fn small_int_arithmetic_stays_fast() {
+        assert_eq!(
+            run("print(40 + 2)\nprint(7 / 2)\nprint(-7 % 3)\n").unwrap(),
+            "42\n3\n-1\n"
+        );
+    }
+
+    #[test]
+    fn value_stays_16_bytes() {
+        // `Big` lives behind an `Rc` precisely so `Value` doesn't grow.
+        assert_eq!(std::mem::size_of::<vm::Value>(), 16);
     }
 }
 
@@ -812,6 +945,54 @@ mod fmt_tests {
         // Precedence: add inside mul stays unparenthesized.
         assert_eq!(fmt("print(1 + 2 * 3)\n"), "print(1 + 2 * 3)\n");
         assert_eq!(fmt("print((1 + 2) * 3)\n"), "print((1 + 2) * 3)\n");
+    }
+
+    #[test]
+    fn fmt_preserves_comments() {
+        // Own-line comments keep their scope; trailing comments keep
+        // their line. Output must stay idempotent.
+        let src = r#"# header
+let x = 1  # trail
+# between
+fn f() -> int:  # sig
+    # body
+    return x  # ret
+let y = 2
+"#;
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            r#"# header
+let x = 1  # trail
+# between
+
+fn f() -> int:  # sig
+    # body
+    return x  # ret
+
+let y = 2
+"#
+        );
+        assert_eq!(fmt(&out), out, "comment output not idempotent");
+    }
+
+    #[test]
+    fn fmt_comment_scopes() {
+        // Comments bind to the block their column says they belong to:
+        // end-of-branch comments stay in the branch, comments on the
+        // `else` line stay on it, else-body comments stay inside.
+        let src = "if a:\n    x()  # t\n    # done\nelse:  # e\n    # inside else\n    y()\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "if a:\n    x()  # t\n    # done\nelse:  # e\n    # inside else\n    y()\n"
+        );
+        assert_eq!(fmt(&out), out);
+    }
+
+    #[test]
+    fn fmt_comments_only_source() {
+        assert_eq!(fmt("# just a note\n"), "# just a note\n");
     }
 
     #[test]

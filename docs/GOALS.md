@@ -186,7 +186,7 @@
   方法 `len` / `add` / `contains` / `remove`;元素唯一
 - `Tuple[...]`: 括号字面量 `(1, "two")`(单元素 `(x)` 仍是括号)、索引 `t[0]`、
   方法 `len`;无解构(最小集)
-- 运行时为线性结构(无哈希),性能后续按需优化(诚实记录)
+- 运行时: 插入序容器 + 哈希索引(2026-08-16 第二轮清理落地)
 
 ### D11. str 方法(2026-08-14 定)
 
@@ -215,18 +215,19 @@
   - JSON: `json_encode(v) -> str`、`json_decode(s) -> Result[Json, str]`;
     `Json` 类型可索引(返回 Json),与 `None` 可比较
 - **后置**(§7.5/§6.1 按需): HTTP 客户端、`Shared[T]`/`Mutex`、包管理
-- 运行时线性容器(无哈希)与 `Json` 的动态性均为诚实记录的简化
+- `Json` 的动态性为诚实记录的简化
 
 ### D14. 工具链: formatter 与 LSP(2026-08-14 定)
 
 - **formatter**(§9.1 官方唯一格式,类 gofmt): AST → 规范文本;4 空格缩进、
   运算符/逗号/泛型参数规范化、if-else 链重排;**幂等**(格式化两次不变);
   **语义保持**(括号按优先级/结合性重排、float 保形 `1.0`、字符串重转义);
-  注释由词法器丢弃(源码中不保留);CLI `sole fmt <file|dir>` / `sole fmt --check`
-- **LSP**(§9.1): 手写 JSON-RPC 2.0 over stdio;full-sync 文档更新;
-  `publishDiagnostics` 复用类型检查器(双语渲染 + 稳定错误码);
-  跳转定义(函数/类型/test/let 绑定,光标在词尾也可);补全(关键字 + 符号表);
-  hover 与增量同步未实现(诚实记录);CLI `sole lsp`
+  **注释保留**(词法器侧通道收集,按行/列归属重排,2026-08-16 第二轮);
+  CLI `sole fmt <file|dir>` / `sole fmt --check`
+- **LSP**(§9.1): 手写 JSON-RPC 2.0 over stdio;增量同步(`change: 2`,
+  UTF-16 行列区间编辑);`publishDiagnostics` 复用类型检查器(双语渲染
+  + 稳定错误码);跳转定义(函数/类型/test/let 绑定,光标在词尾也可);
+  补全(关键字 + 符号表);hover(类型/签名,2026-08-16 第二轮);CLI `sole lsp`
 
 ---
 
@@ -511,3 +512,4 @@
     借用检查器接受(skip 机制未穿透调用,绕用临时变量/`mut ref` 累计) |
     M4 验收"能完成一个真实小项目"落地;`sole run` 传参能力与自赋值留待 M5 |
 | 2026-08-14 | **M3 完成**: eval 迁移到字节码 VM(新增 `compiler.rs` AST→字节码、`vm.rs` stack VM);协程调度器与通道运行时(`go`/`task_group`/`Chan[T]` send/recv/close、缓冲/无缓冲、`for v in ch`、`yield`);性能优化: locals 值语义 + 惰性借用 cell、`Value` 缩至 24B(Str 用 `Rc<str>`、Struct 装箱)、`&Instr` 引用分派 + int 算术快路径、run-until-block 协作调度(与 §7.3"仅在通道操作与 yield 处切换"对齐)、零拷贝调用(局部变量直接放任务栈,Frame 改 base 索引)、当前函数 code 缓存、`CallMethod(m, argc)` 编码参数个数;新增 `bench/` 对比 CPython | 对齐 M3 验收"性能 ≥ CPython 同量级": fib(28)+sum_loop(1e6) 全程序 ~1.0x CPython(初版 3.7-4.4x),fib/sum_loop 单独均反超;详细数据见 bench/README |
+| 2026-08-16 | **技术债务第二轮**: C6+S2 运行时索引错误归 E02xx 段(E0224/E0225)并经统一 `err(Msg, pos)` 渲染;C8 `Function.lines` 升级为 `spans`(line,col) 错误带列;D10 普通赋值允许 `x = f(x)`(RHS 求值后复活绑定,FieldAssign 仍拒写已移出对象,修复静默写穿透);D9 `sole run f.sole -- args` + `args()`/`exit(code)` 内建,json_tool 成真实 CLI;P3 Json 类型快判 `is_obj/is_arr/is_num/is_bool/is_null`(stats 热路径落地);P4 方法分发改两级哈希表;P2 `Value` 实达 16B(`Str(Rc<String>)` 瘦指针 + `Range` 装箱 + `Big` 独立变体);D2 Dict/Set 哈希索引 + 插入序保持;D1 `int` 任意精度(词法保留数字文本 → `PushInt`/`PushBig` 双指令 → i64 快路径溢出自动晋升 `num-bigint`,JSON 经 `arbitrary_precision` 保精度);D6 LSP hover(类型/签名)+ 增量同步(`change: 2`,UTF-16 区间编辑);D7 formatter 保留注释(词法侧通道 + 按行/列归属重排,幂等);P1 帧切换检测移入 Call/Return 臂 + i64 算术快路径直连,fib 较基线 -35%;S1 typecheck 拆分 setup/scope/stmt/expr/call/methods 六模块、vm 拆分 value/program;新增 `ElseBranch::Block` else 位置 span | DEBT.md 所列 14 项清零;遗留 C7/D3/D4/D5/D8 均已登记理由(设计先行或需求待定) |

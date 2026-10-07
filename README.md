@@ -39,10 +39,12 @@
   `&Instr` 引用分派,run-until-block 协作调度(性能与 CPython 同量级,见 `bench/`)
 - 并发原语:协程(`go`)、`task_group`(结构化并发:作用域等待 + 取消传播)、
   通道 `Chan[T]`(`send`/`recv`/`close`、缓冲/无缓冲、`for v in ch` 接收循环、`yield`)
-- formatter:官方唯一格式(类 gofmt),`sole fmt <file|dir>` / `sole fmt --check`
-- LSP server:`sole lsp`(full-sync 诊断、跳转定义、补全;复用类型检查器双语渲染)
+- formatter:官方唯一格式(类 gofmt,保留注释),`sole fmt <file|dir>` / `sole fmt --check`
+- LSP server:`sole lsp`(增量同步诊断、跳转定义、补全、hover;复用类型检查器双语渲染)
+- `int` 任意精度:i64 快路径 + 溢出自动晋升大整数;`sole run f.sole -- args`
+  传参 + `args()`/`exit(code)` 内建
 - 可变性检查(`let mut` 才能重新赋值)、错误定位(词法/解析/类型检查错误带行列,
-  求值错误带行号;索引越界报 E0223)
+  求值错误带行列;索引越界报 E0223)
 - 双语错误信息(`--lang en|zh` 或 `SOLE_LANG` 环境变量)
 
 ## 快速开始(在任意有 Rust 的机器上)
@@ -73,7 +75,8 @@ cargo test --workspace
 cargo run --bin sole -- test examples/projects/json_tool/main.sole
 ```
 
-注:CLI 暂不支持向脚本传参,演示通过 `sole test` 驱动 `main(args)`(留待 M5)。
+注:`sole run file.sole -- arg1 arg2` 可向脚本传参(`args()` 内建读取);
+项目内演示仍以 `sole test` 驱动 `main(args)`。
 
 错误信息默认英文(带稳定错误码,如 `[E0201]`),用 `--lang zh` 或环境变量 `SOLE_LANG=zh` 切换中文。
 
@@ -88,11 +91,9 @@ cargo test --workspace
 
 ## 暂定 / 未实现
 
-- `int` 暂用 `i64`(设计目标为任意精度,GOALS §4.1)
 - 整数除法暂为截断;truthiness 暂为 Python 风格(暂定)
 - 借用检查为最小规则集(变量级 + 字段级借用、借用传播);细粒度区域与索引借用未实现
 - 未实现: `select` 多路复用、`Shared[T]` / `Mutex`(GOALS §7.5)、自定义泛型类型/接口
   (D9 明确不做)、自定义类型的 `for` 迭代(仅内建容器)
 - `ref` / `mut ref` 有完整借用检查,但无运行时借用逃逸检测(由静态检查保证)
-- formatter 丢弃注释(词法器不保留);LSP 的 hover 与增量同步未实现(D14 诚实记录)
 - 完整技术债务清单: [docs/DEBT.md](docs/DEBT.md)

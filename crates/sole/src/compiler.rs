@@ -4,6 +4,7 @@
 //! indices; globals to program-global indices. Calls with `ref`/`mut ref`
 //! parameters push the caller's cell (`PushVarCell`) so writes propagate.
 
+use num_bigint::BigInt;
 use sole_parser::{
     BinOp, Block, ElseBranch, Expr, FnDef, ImplDef, Item, Program, Stmt, TestDef, UnOp,
 };
@@ -12,17 +13,17 @@ use std::collections::HashMap;
 use crate::vm::{CompiledProgram, Function, Instr, Value};
 use std::rc::Rc;
 
-/// Bytecode buffer that records a source line per instruction, so runtime
-/// errors can report where they happened (`lines[ip]`).
+/// Bytecode buffer that records a source position per instruction, so
+/// runtime errors can report where they happened (`spans[ip]`).
 #[derive(Default)]
 struct CodeBuf {
     code: Vec<Instr>,
-    lines: Vec<u32>,
+    spans: Vec<(u32, u32)>,
 }
 
 impl CodeBuf {
-    fn push(&mut self, instr: Instr, line: u32) {
-        self.lines.push(line);
+    fn push(&mut self, instr: Instr, pos: (u32, u32)) {
+        self.spans.push(pos);
         self.code.push(instr);
     }
 
@@ -70,6 +71,8 @@ pub struct Compiler<'a> {
     functions: Vec<Function>,
     strings: Vec<String>,
     string_map: HashMap<String, u32>,
+    bigints: Vec<BigInt>,
+    bigint_map: HashMap<String, u32>,
     methods: Vec<((String, String), usize)>,
     structs: Vec<(String, Vec<String>)>,
     chan_elem: Vec<String>,
@@ -84,6 +87,8 @@ pub fn compile(program: &Program) -> Result<CompiledProgram, String> {
         functions: Vec::new(),
         strings: Vec::new(),
         string_map: HashMap::new(),
+        bigints: Vec::new(),
+        bigint_map: HashMap::new(),
         methods: Vec::new(),
         structs: Vec::new(),
         chan_elem: Vec::new(),
@@ -109,6 +114,7 @@ pub fn compile(program: &Program) -> Result<CompiledProgram, String> {
         functions: c.functions,
         globals: Vec::new(),
         strings: c.strings.into_iter().map(Rc::from).collect(),
+        bigints: c.bigints.into_iter().map(Rc::new).collect(),
         methods: c.methods,
         structs: c.structs,
         chan_elem: c.chan_elem,
@@ -130,7 +136,7 @@ impl<'a> Compiler<'a> {
                         nparams: f.params.len() as u32,
                         nlocals: f.params.len() as u32,
                         code: vec![Instr::Halt],
-                        lines: vec![0],
+                        spans: vec![(0, 0)],
                     });
                 }
                 Item::Test(t) => {
@@ -139,7 +145,7 @@ impl<'a> Compiler<'a> {
                         nparams: 0,
                         nlocals: 0,
                         code: vec![Instr::Halt],
-                        lines: vec![0],
+                        spans: vec![(0, 0)],
                     });
                 }
                 Item::Impl(imp) => {
@@ -149,7 +155,7 @@ impl<'a> Compiler<'a> {
                             nparams: m.params.len() as u32,
                             nlocals: m.params.len() as u32,
                             code: vec![Instr::Halt],
-                            lines: vec![0],
+                            spans: vec![(0, 0)],
                         });
                     }
                 }
@@ -170,7 +176,7 @@ impl<'a> Compiler<'a> {
                 nparams: 0,
                 nlocals: 0,
                 code: Vec::new(),
-                lines: Vec::new(),
+                spans: Vec::new(),
             },
         );
         let mut code = CodeBuf::default();
@@ -183,8 +189,8 @@ impl<'a> Compiler<'a> {
                 self.compile_stmt(stmt, &mut code, &mut ctx)?;
             }
         }
-        code.push(Instr::Halt, 0);
-        self.functions[0].lines = code.lines;
+        code.push(Instr::Halt, (0, 0));
+        self.functions[0].spans = code.spans;
         self.functions[0].code = code.code;
         self.functions[0].nlocals = ctx.next_local;
         Ok(())
@@ -199,8 +205,8 @@ impl<'a> Compiler<'a> {
             next_local: 0,
         };
         self.compile_block(&t.body, &mut code, &mut ctx)?;
-        code.push(Instr::RetUnit, 0);
-        self.functions[idx].lines = code.lines;
+        code.push(Instr::RetUnit, (0, 0));
+        self.functions[idx].spans = code.spans;
         self.functions[idx].code = code.code;
         self.functions[idx].nlocals = ctx.next_local;
         Ok(())
@@ -212,8 +218,8 @@ impl<'a> Compiler<'a> {
         let mut code = CodeBuf::default();
         let mut ctx = FuncCtx::new(f);
         self.compile_block(&f.body, &mut code, &mut ctx)?;
-        code.push(Instr::Return, 0);
-        self.functions[idx].lines = code.lines;
+        code.push(Instr::Return, (0, 0));
+        self.functions[idx].spans = code.spans;
         self.functions[idx].code = code.code;
         self.functions[idx].nlocals = ctx.next_local;
         Ok(())
@@ -226,8 +232,8 @@ impl<'a> Compiler<'a> {
             let mut ctx = FuncCtx::new(m);
             // `self` is slot 0, bound by CallMethod at runtime.
             self.compile_block(&m.body, &mut code, &mut ctx)?;
-            code.push(Instr::Return, 0);
-            self.functions[idx].lines = code.lines;
+            code.push(Instr::Return, (0, 0));
+            self.functions[idx].spans = code.spans;
             self.functions[idx].code = code.code;
             self.functions[idx].nlocals = ctx.next_local;
             self.methods.push(((imp.ty.clone(), m.name.clone()), idx));
@@ -259,6 +265,19 @@ impl<'a> Compiler<'a> {
         i
     }
 
+    /// Interns an integer literal too big for `i64`. Lexer output is
+    /// digit text, so the parse cannot fail.
+    fn intern_bigint(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.bigint_map.get(s) {
+            return i;
+        }
+        let i = self.bigints.len() as u32;
+        self.bigints
+            .push(BigInt::parse_bytes(s.as_bytes(), 10).expect("digit text"));
+        self.bigint_map.insert(s.to_string(), i);
+        i
+    }
+
     fn compile_block(
         &mut self,
         block: &Block,
@@ -277,37 +296,37 @@ impl<'a> Compiler<'a> {
         code: &mut CodeBuf,
         ctx: &mut FuncCtx,
     ) -> Result<(), String> {
-        let line = stmt.span().line as u32;
+        let pos = (stmt.span().line as u32, stmt.span().column as u32);
         match stmt {
             Stmt::Let { name, value, .. } => {
                 self.compile_expr(value, code, ctx)?;
                 let slot = ctx.slot(name);
-                code.push(Instr::StoreVar(slot), line);
+                code.push(Instr::StoreVar(slot), pos);
             }
             Stmt::Assign { name, value, .. } => {
                 self.compile_expr(value, code, ctx)?;
                 let slot = ctx.slot(name);
-                code.push(Instr::StoreVar(slot), line);
+                code.push(Instr::StoreVar(slot), pos);
             }
             Stmt::FieldAssign {
                 obj, field, value, ..
             } => {
                 let obj_slot = ctx.slot(obj);
-                code.push(Instr::PushVarCell(obj_slot), line);
+                code.push(Instr::PushVarCell(obj_slot), pos);
                 self.compile_expr(value, code, ctx)?;
                 let f = self.intern_string(field);
-                code.push(Instr::SetField(f), line);
+                code.push(Instr::SetField(f), pos);
             }
             Stmt::Expr(expr) => {
                 self.compile_expr(expr, code, ctx)?;
-                code.push(Instr::Pop, line);
+                code.push(Instr::Pop, pos);
             }
             Stmt::Return { value, .. } => {
                 match value {
                     Some(e) => self.compile_expr(e, code, ctx)?,
-                    None => code.push(Instr::PushUnit, line),
+                    None => code.push(Instr::PushUnit, pos),
                 }
-                code.push(Instr::Return, 0);
+                code.push(Instr::Return, (0, 0));
             }
             Stmt::If {
                 cond,
@@ -317,15 +336,15 @@ impl<'a> Compiler<'a> {
             } => {
                 self.compile_expr(cond, code, ctx)?;
                 let jump_false = code.len();
-                code.push(Instr::JumpIfFalse(0), line);
+                code.push(Instr::JumpIfFalse(0), pos);
                 self.compile_block(then_block, code, ctx)?;
                 let jump_end = code.len();
-                code.push(Instr::Jump(0), line);
+                code.push(Instr::Jump(0), pos);
                 let else_start = code.len();
                 code.patch(jump_false, Instr::JumpIfFalse(else_start as u32));
                 match else_block {
                     Some(ElseBranch::If(s)) => self.compile_stmt(s, code, ctx)?,
-                    Some(ElseBranch::Block(b)) => self.compile_block(b, code, ctx)?,
+                    Some(ElseBranch::Block(b, _)) => self.compile_block(b, code, ctx)?,
                     None => {}
                 }
                 code.patch(jump_end, Instr::Jump(code.len() as u32));
@@ -334,11 +353,11 @@ impl<'a> Compiler<'a> {
                 let loop_start = code.len();
                 self.compile_expr(cond, code, ctx)?;
                 let jump_false = code.len();
-                code.push(Instr::JumpIfFalse(0), line);
+                code.push(Instr::JumpIfFalse(0), pos);
                 self.loop_stack.push((loop_start, Vec::new()));
                 self.compile_block(body, code, ctx)?;
                 let (_, break_patches) = self.loop_stack.pop().unwrap();
-                code.push(Instr::Jump(loop_start as u32), line);
+                code.push(Instr::Jump(loop_start as u32), pos);
                 let loop_end_addr = code.len();
                 code.patch(jump_false, Instr::JumpIfFalse(loop_end_addr as u32));
                 for p in break_patches {
@@ -352,17 +371,17 @@ impl<'a> Compiler<'a> {
                 ..
             } => {
                 self.compile_expr(iterable, code, ctx)?;
-                code.push(Instr::ForInit, line);
+                code.push(Instr::ForInit, pos);
                 let loop_start = code.len();
                 let jump_next = code.len();
-                code.push(Instr::ForNext(0), line);
+                code.push(Instr::ForNext(0), pos);
                 // Store the yielded element into the loop variable.
                 let var_slot = ctx.slot(var);
-                code.push(Instr::StoreVar(var_slot), line);
+                code.push(Instr::StoreVar(var_slot), pos);
                 self.loop_stack.push((loop_start, Vec::new()));
                 self.compile_block(body, code, ctx)?;
                 let (_, break_patches) = self.loop_stack.pop().unwrap();
-                code.push(Instr::Jump(loop_start as u32), line);
+                code.push(Instr::Jump(loop_start as u32), pos);
                 let loop_end_addr = code.len();
                 code.patch(jump_next, Instr::ForNext(loop_end_addr as u32));
                 for p in break_patches {
@@ -373,20 +392,20 @@ impl<'a> Compiler<'a> {
                 let Some((_, patches)) = self.loop_stack.last_mut() else {
                     return Err("break outside loop".into());
                 };
-                let pos = code.len();
-                code.push(Instr::Jump(0), line);
-                patches.push(pos);
+                let at = code.len();
+                code.push(Instr::Jump(0), pos);
+                patches.push(at);
             }
             Stmt::Continue { .. } => {
                 let Some((start, _)) = self.loop_stack.last() else {
                     return Err("continue outside loop".into());
                 };
-                code.push(Instr::Jump(*start as u32), line);
+                code.push(Instr::Jump(*start as u32), pos);
             }
             Stmt::TaskGroup { body, .. } => {
-                code.push(Instr::TaskGroupBegin, line);
+                code.push(Instr::TaskGroupBegin, pos);
                 self.compile_block(body, code, ctx)?;
-                code.push(Instr::TaskGroupEnd, line);
+                code.push(Instr::TaskGroupEnd, pos);
             }
             Stmt::Go { call, .. } => {
                 let Expr::Call { callee, args, .. } = call.as_ref() else {
@@ -399,15 +418,15 @@ impl<'a> Compiler<'a> {
                 for a in args {
                     self.compile_expr(a, code, ctx)?;
                 }
-                code.push(Instr::Go(fn_idx as u32, args.len() as u32), line);
-                code.push(Instr::Pop, line);
+                code.push(Instr::Go(fn_idx as u32, args.len() as u32), pos);
+                code.push(Instr::Pop, pos);
             }
             Stmt::Yield { .. } => {
-                code.push(Instr::Yield, line);
+                code.push(Instr::Yield, pos);
             }
             Stmt::Assert { expr, .. } => {
                 self.compile_expr(expr, code, ctx)?;
-                code.push(Instr::Assert, line);
+                code.push(Instr::Assert, pos);
             }
         }
         Ok(())
@@ -419,69 +438,75 @@ impl<'a> Compiler<'a> {
         code: &mut CodeBuf,
         ctx: &mut FuncCtx,
     ) -> Result<(), String> {
-        let line = expr.span().line as u32;
+        let pos = (expr.span().line as u32, expr.span().column as u32);
         match expr {
-            Expr::Int(n, _) => code.push(Instr::PushInt(*n), line),
-            Expr::Float(f, _) => code.push(Instr::PushFloat(*f), line),
+            Expr::Int(n, _) => match n.parse::<i64>() {
+                Ok(i) => code.push(Instr::PushInt(i), pos),
+                Err(_) => {
+                    let i = self.intern_bigint(n);
+                    code.push(Instr::PushBig(i), pos);
+                }
+            },
+            Expr::Float(f, _) => code.push(Instr::PushFloat(*f), pos),
             Expr::Str(s, _) => {
                 let i = self.intern_string(s);
-                code.push(Instr::PushStr(i), line);
+                code.push(Instr::PushStr(i), pos);
             }
-            Expr::Bool(b, _) => code.push(Instr::PushBool(*b), line),
+            Expr::Bool(b, _) => code.push(Instr::PushBool(*b), pos),
             Expr::List(items, _) => {
                 for it in items {
                     self.compile_expr(it, code, ctx)?;
                 }
-                code.push(Instr::MakeList(items.len() as u32), line);
+                code.push(Instr::MakeList(items.len() as u32), pos);
             }
             Expr::Dict(pairs, _) => {
                 for (k, v) in pairs {
                     self.compile_expr(k, code, ctx)?;
                     self.compile_expr(v, code, ctx)?;
                 }
-                code.push(Instr::MakeDict(pairs.len() as u32), line);
+                code.push(Instr::MakeDict(pairs.len() as u32), pos);
             }
             Expr::Set(items, _) => {
                 for it in items {
                     self.compile_expr(it, code, ctx)?;
                 }
-                code.push(Instr::MakeSet(items.len() as u32), line);
+                code.push(Instr::MakeSet(items.len() as u32), pos);
             }
             Expr::Tuple(items, _) => {
                 for it in items {
                     self.compile_expr(it, code, ctx)?;
                 }
-                code.push(Instr::MakeTuple(items.len() as u32), line);
+                code.push(Instr::MakeTuple(items.len() as u32), pos);
             }
             Expr::Ident(name, _) => {
                 if name == "None" {
-                    code.push(Instr::PushNone, line);
+                    code.push(Instr::PushNone, pos);
                 } else {
                     let slot = ctx.slot(name);
-                    code.push(Instr::PushVar(slot), line);
+                    code.push(Instr::PushVar(slot), pos);
                 }
             }
             Expr::Unary { op, expr, .. } => match op {
                 UnOp::Neg => {
                     self.compile_expr(expr, code, ctx)?;
-                    code.push(Instr::Neg, line);
+                    code.push(Instr::Neg, pos);
                 }
                 UnOp::Not => {
                     self.compile_expr(expr, code, ctx)?;
-                    code.push(Instr::Not, line);
+                    code.push(Instr::Not, pos);
                 }
             },
             Expr::Binary { op, lhs, rhs, .. } => {
                 self.compile_expr(lhs, code, ctx)?;
                 self.compile_expr(rhs, code, ctx)?;
-                code.push(Instr::Binary(op_to_binop(*op)), line);
+                code.push(Instr::Binary(op_to_binop(*op)), pos);
             }
             Expr::Call { callee, args, span } => {
                 // Method call: obj.method(args)
                 if let Expr::Field { obj, name, .. } = callee.as_ref() {
                     if let Expr::Ident(obj_name, _) = obj.as_ref() {
                         let obj_slot = ctx.slot(obj_name);
-                        code.push(Instr::PushVarCell(obj_slot), line);
+                        code.push(Instr::PushVarCell(obj_slot), pos);
                     } else {
                         self.compile_expr(obj, code, ctx)?;
                     }
@@ -489,7 +514,7 @@ impl<'a> Compiler<'a> {
                         self.compile_expr(a, code, ctx)?;
                     }
                     let m = self.intern_string(name);
-                    code.push(Instr::CallMethod(m, args.len() as u32 + 1), line);
+                    code.push(Instr::CallMethod(m, args.len() as u32 + 1), pos);
                     return Ok(());
                 }
                 // Channel construction: `Chan[int]()` / `Chan[int](10)`.
@@ -500,9 +525,9 @@ impl<'a> Compiler<'a> {
                                 self.compile_expr(a, code, ctx)?;
                             }
                             if args.is_empty() {
-                                code.push(Instr::PushInt(0), line);
+                                code.push(Instr::PushInt(0), pos);
                             }
-                            code.push(Instr::MakeChan(0), line);
+                            code.push(Instr::MakeChan(0), pos);
                             return Ok(());
                         }
                     }
@@ -515,7 +540,7 @@ impl<'a> Compiler<'a> {
                             self.compile_expr(a, code, ctx)?;
                         }
                         let si = self.structs.iter().position(|(n, _)| n == name).unwrap() as u32;
-                        code.push(Instr::MakeStruct(si), line);
+                        code.push(Instr::MakeStruct(si), pos);
                         return Ok(());
                     }
                     // Channel construction handled above (Index form).
@@ -527,51 +552,51 @@ impl<'a> Compiler<'a> {
                             for a in args {
                                 self.compile_expr(a, code, ctx)?;
                             }
-                            code.push(Instr::PushSome, line);
+                            code.push(Instr::PushSome, pos);
                             return Ok(());
                         }
                         "None" => {
-                            code.push(Instr::PushNone, line);
+                            code.push(Instr::PushNone, pos);
                             return Ok(());
                         }
                         "Ok" => {
                             for a in args {
                                 self.compile_expr(a, code, ctx)?;
                             }
-                            code.push(Instr::PushOk, line);
+                            code.push(Instr::PushOk, pos);
                             return Ok(());
                         }
                         "Err" => {
                             for a in args {
                                 self.compile_expr(a, code, ctx)?;
                             }
-                            code.push(Instr::PushErr, line);
+                            code.push(Instr::PushErr, pos);
                             return Ok(());
                         }
                         "print" => {
                             for a in args {
                                 self.compile_expr(a, code, ctx)?;
                             }
-                            code.push(Instr::BuiltinPrint(args.len() as u32), line);
+                            code.push(Instr::BuiltinPrint(args.len() as u32), pos);
                             return Ok(());
                         }
                         n if is_std_builtin(n) => {
                             for a in args {
                                 self.compile_expr(a, code, ctx)?;
                             }
-                            code.push(Instr::Builtin(std_builtin_id(n)), line);
+                            code.push(Instr::Builtin(std_builtin_id(n)), pos);
                             return Ok(());
                         }
                         "range" => {
                             // `range(n)` = `range(0, n)`: push the default
                             // start so BuiltinRange always pops two values.
                             if args.len() == 1 {
-                                code.push(Instr::PushInt(0), line);
+                                code.push(Instr::PushInt(0), pos);
                             }
                             for a in args {
                                 self.compile_expr(a, code, ctx)?;
                             }
-                            code.push(Instr::BuiltinRange, line);
+                            code.push(Instr::BuiltinRange, pos);
                             return Ok(());
                         }
                         _ => self.fn_index(name),
@@ -586,34 +611,34 @@ impl<'a> Compiler<'a> {
                 for a in args {
                     self.compile_expr(a, code, ctx)?;
                 }
-                code.push(Instr::Call(fn_idx as u32), line);
+                code.push(Instr::Call(fn_idx as u32), pos);
             }
             Expr::Field { obj, name, .. } => {
                 if let Expr::Ident(obj_name, _) = obj.as_ref() {
                     let obj_slot = ctx.slot(obj_name);
-                    code.push(Instr::PushVarCell(obj_slot), line);
+                    code.push(Instr::PushVarCell(obj_slot), pos);
                 } else {
                     self.compile_expr(obj, code, ctx)?;
                 }
                 let f = self.intern_string(name);
-                code.push(Instr::GetField(f), line);
+                code.push(Instr::GetField(f), pos);
             }
             Expr::Index { obj, index, .. } => {
                 if let Expr::Ident(obj_name, _) = obj.as_ref() {
                     let obj_slot = ctx.slot(obj_name);
-                    code.push(Instr::PushVarCell(obj_slot), line);
+                    code.push(Instr::PushVarCell(obj_slot), pos);
                 } else {
                     self.compile_expr(obj, code, ctx)?;
                 }
                 self.compile_expr(index, code, ctx)?;
-                code.push(Instr::IndexGet, line);
+                code.push(Instr::IndexGet, pos);
             }
             Expr::Borrow { mutable, expr, .. } => {
                 let Expr::Ident(name, _) = expr.as_ref() else {
                     return Err("ref target must be a variable or index".into());
                 };
                 let slot = ctx.slot(name);
-                code.push(Instr::BorrowVar(*mutable, slot), line);
+                code.push(Instr::BorrowVar(*mutable, slot), pos);
             }
         }
         Ok(())
@@ -640,6 +665,8 @@ pub fn std_builtin_id(name: &str) -> u8 {
         "pow" => 10,
         "json_encode" => 11,
         "json_decode" => 12,
+        "args" => 13,
+        "exit" => 14,
         _ => 0,
     }
 }
@@ -667,10 +694,11 @@ impl Value {
     pub fn display(&self) -> String {
         match self {
             Value::Int(n) => n.to_string(),
+            Value::Big(b) => b.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Str(s) => s.to_string(),
-            Value::Range { start, end } => format!("range({}, {})", start, end),
+            Value::Range(r) => format!("range({}, {})", r.start, r.end),
             Value::List(items) => format!(
                 "[{}]",
                 items
@@ -694,19 +722,19 @@ impl Value {
             Value::Some(v) => format!("Some({})", v.display()),
             Value::Ok(v) => format!("Ok({})", v.display()),
             Value::Err(v) => format!("Err({})", v.display()),
-            Value::Dict(pairs) => format!(
+            Value::Dict(d) => format!(
                 "{{{}}}",
-                pairs
-                    .borrow()
+                d.borrow()
+                    .items
                     .iter()
                     .map(|(k, v)| format!("{}: {}", k.display(), v.display()))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Value::Set(items) => format!(
+            Value::Set(s) => format!(
                 "{{{}}}",
-                items
-                    .borrow()
+                s.borrow()
+                    .items
                     .iter()
                     .map(Value::display)
                     .collect::<Vec<_>>()

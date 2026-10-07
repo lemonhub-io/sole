@@ -121,8 +121,7 @@ fn merge_dicts(a: Dict[str, Json], b: Dict[str, Json]) -> Dict[str, Json]:
     return out
 
 fn is_container(v: Json) -> bool:
-    let s = v.to_str()
-    return s.starts_with("{") or s.starts_with("[")
+    return v.is_obj() or v.is_arr()
 
 fn merge_recursive(a: Json, b: Json) -> Json:
     if is_container(a) and is_container(b):

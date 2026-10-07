@@ -46,7 +46,7 @@ pub enum TokenKind {
     Eof,
     // Literals & identifiers
     Ident(String),
-    Int(i64),
+    Int(String),
     Float(f64),
     Str(String),
     // Operators & punctuation
@@ -87,6 +87,19 @@ impl Token {
     }
 }
 
+/// A `#` comment recorded during lexing. The token stream drops comments,
+/// but tools like the formatter need them (`lex_with_comments`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comment {
+    pub line: usize,
+    pub column: usize,
+    /// `#` and the comment text, trailing whitespace trimmed.
+    pub text: String,
+    /// Occupies its own line (only whitespace before `#`) vs trailing
+    /// after code on the same line.
+    pub own_line: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LexError {
     pub diag: Diagnostic,
@@ -102,7 +115,16 @@ impl std::error::Error for LexError {}
 
 /// Lexes a whole source file into a token stream ending with `Eof`.
 pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source).run()
+    lex_with_comments(source).map(|(tokens, _)| tokens)
+}
+
+/// Lexes like `lex` and additionally returns every comment in source
+/// order. The comments are not tokens; they only exist for tooling that
+/// needs trivia (the formatter).
+pub fn lex_with_comments(source: &str) -> Result<(Vec<Token>, Vec<Comment>), LexError> {
+    let mut lexer = Lexer::new(source);
+    lexer.run()?;
+    Ok((lexer.tokens, lexer.comments))
 }
 
 struct Lexer<'a> {
@@ -111,6 +133,7 @@ struct Lexer<'a> {
     line: usize,
     col: usize,
     tokens: Vec<Token>,
+    comments: Vec<Comment>,
     indent_stack: Vec<usize>,
     paren_depth: usize,
     at_line_start: bool,
@@ -124,13 +147,14 @@ impl<'a> Lexer<'a> {
             line: 1,
             col: 1,
             tokens: Vec::new(),
+            comments: Vec::new(),
             indent_stack: vec![0],
             paren_depth: 0,
             at_line_start: true,
         }
     }
 
-    fn run(mut self) -> Result<Vec<Token>, LexError> {
+    fn run(&mut self) -> Result<(), LexError> {
         while self.pos < self.src.len() {
             if self.at_line_start {
                 self.handle_line_start()?;
@@ -157,9 +181,7 @@ impl<'a> Lexer<'a> {
                     return Err(self.error(Msg::TabNotAllowed));
                 }
                 Some(b'#') => {
-                    while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
-                        self.advance();
-                    }
+                    self.lex_comment(false);
                 }
                 Some(b'"') => self.lex_string()?,
                 Some(c) if c.is_ascii_digit() => self.lex_number()?,
@@ -176,7 +198,7 @@ impl<'a> Lexer<'a> {
             self.push(TokenKind::Dedent, self.line, self.col);
         }
         self.push(TokenKind::Eof, self.line, self.col);
-        Ok(self.tokens)
+        Ok(())
     }
 
     /// Handles the start of a new logical line: counts indentation, emits
@@ -199,10 +221,17 @@ impl<'a> Lexer<'a> {
             }
             // Blank or comment-only lines do not affect indentation.
             match self.peek() {
-                Some(b'\n') | Some(b'#') => {
+                Some(b'\n') => {
                     while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
                         self.advance();
                     }
+                    if self.pos < self.src.len() {
+                        self.advance(); // consume the newline silently
+                    }
+                    continue;
+                }
+                Some(b'#') => {
+                    self.lex_comment(true);
                     if self.pos < self.src.len() {
                         self.advance(); // consume the newline silently
                     }
@@ -275,10 +304,31 @@ impl<'a> Lexer<'a> {
             let value = text.parse::<f64>().map_err(|_| self.error(Msg::BadFloat))?;
             self.push(TokenKind::Float(value), sl, sc);
         } else {
-            let value = text.parse::<i64>().map_err(|_| self.error(Msg::BadInt))?;
-            self.push(TokenKind::Int(value), sl, sc);
+            // Keep the digit text: arbitrary-precision integers are decoded
+            // by the compiler, so literals never overflow the lexer.
+            self.push(TokenKind::Int(text), sl, sc);
         }
         Ok(())
+    }
+
+    /// Records a `#` comment (to end-of-line) in `comments`, without
+    /// emitting a token.
+    fn lex_comment(&mut self, own_line: bool) {
+        let (line, column) = (self.line, self.col);
+        let start = self.pos;
+        while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
+            self.advance();
+        }
+        let text = std::str::from_utf8(&self.src[start..self.pos])
+            .expect("comment text is UTF-8")
+            .trim_end()
+            .to_string();
+        self.comments.push(Comment {
+            line,
+            column,
+            text,
+            own_line,
+        });
     }
 
     fn lex_ident(&mut self) {
@@ -539,7 +589,7 @@ mod tests {
                 TokenKind::Let,
                 TokenKind::Ident("x".into()),
                 TokenKind::Eq,
-                TokenKind::Int(42),
+                TokenKind::Int("42".into()),
                 TokenKind::Newline,
                 TokenKind::Eof,
             ]
@@ -558,7 +608,7 @@ mod tests {
         assert_eq!(
             kinds("1_000_000 2.5\n"),
             vec![
-                TokenKind::Int(1_000_000),
+                TokenKind::Int("1000000".into()),
                 TokenKind::Float(2.5),
                 TokenKind::Newline,
                 TokenKind::Eof,
@@ -587,9 +637,9 @@ mod tests {
         assert_eq!(
             kinds("1e 2x\n"),
             vec![
-                TokenKind::Int(1),
+                TokenKind::Int("1".into()),
                 TokenKind::Ident("e".into()),
-                TokenKind::Int(2),
+                TokenKind::Int("2".into()),
                 TokenKind::Ident("x".into()),
                 TokenKind::Newline,
                 TokenKind::Eof,
@@ -617,7 +667,7 @@ mod tests {
                 TokenKind::Let,
                 TokenKind::Ident("x".into()),
                 TokenKind::Eq,
-                TokenKind::Int(1),
+                TokenKind::Int("1".into()),
                 TokenKind::Newline,
                 TokenKind::Eof,
             ]
@@ -644,7 +694,7 @@ mod tests {
                 TokenKind::Return,
                 TokenKind::Ident("a".into()),
                 TokenKind::Plus,
-                TokenKind::Int(1),
+                TokenKind::Int("1".into()),
                 TokenKind::Newline,
                 TokenKind::Dedent,
                 TokenKind::Eof,

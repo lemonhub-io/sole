@@ -1,85 +1,71 @@
-fn is_scalar_num(s: str) -> bool:
-    if s == "true" or s == "false" or s == "None":
-        return false
-    if s.starts_with("{") or s.starts_with("["):
-        return false
-    if s.starts_with("\""):
-        return false
-    let parsed = s.to_float()
-    return parsed.is_ok()
-
 fn sum_into(v: Json) -> float:
-    let s = v.to_str()
-    if s.starts_with("{"):
+    if v.is_obj():
         let mut total = 0.0
         for k in v.keys():
             total = total + sum_into(v[k])
         return total
-    if s.starts_with("["):
+    if v.is_arr():
         let mut total = 0.0
         let mut i = 0
         while i < v.len():
             total = total + sum_into(v[i])
             i = i + 1
         return total
-    if is_scalar_num(s):
-        return s.to_float().unwrap()
+    if v.is_num():
+        return v.to_str().to_float().unwrap()
     return 0.0
 
 fn count_into(v: Json) -> int:
-    let s = v.to_str()
-    if s.starts_with("{"):
+    if v.is_obj():
         let mut total = 0
         for k in v.keys():
             total = total + count_into(v[k])
         return total
-    if s.starts_with("["):
+    if v.is_arr():
         let mut total = 0
         let mut i = 0
         while i < v.len():
             total = total + count_into(v[i])
             i = i + 1
         return total
-    if is_scalar_num(s):
+    if v.is_num():
         return 1
     return 0
 
 fn min_into(v: Json, best: float) -> float:
-    let s = v.to_str()
-    if s.starts_with("{"):
+    if v.is_obj():
         let mut b = best
         for k in v.keys():
             b = min_into(v[k], b)
         return b
-    if s.starts_with("["):
+    if v.is_arr():
         let mut b = best
         let mut i = 0
         while i < v.len():
             b = min_into(v[i], b)
             i = i + 1
         return b
-    if is_scalar_num(s):
-        let f = s.to_float().unwrap()
+    if v.is_num():
+        let f = v.to_str().to_float().unwrap()
         if f < best:
             return f
     return best
 
 fn max_into(v: Json, best: float) -> float:
-    let s = v.to_str()
-    if s.starts_with("{"):
+    if v.is_obj():
         let mut b = best
         for k in v.keys():
             b = max_into(v[k], b)
         return b
-    if s.starts_with("["):
+    if v.is_arr():
         let mut b = best
         let mut i = 0
         while i < v.len():
             b = max_into(v[i], b)
             i = i + 1
         return b
-    if is_scalar_num(s):
-        let f = s.to_float().unwrap()
+    if v.is_num():
+        let f = v.to_str().to_float().unwrap()
         if f > best:
             return f
     return best
@@ -94,29 +80,27 @@ fn avg_values(root: Json) -> Result[float, str]:
     return Ok(sum_into(root) / n)
 
 fn min_values(root: Json) -> Result[float, str]:
-    let s = root.to_str()
     if count_into(root) == 0:
         return Err("no numbers found")
-    if is_scalar_num(s):
-        return Ok(s.to_float().unwrap())
-    return Ok(min_into(root, 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0))
+    if root.is_num():
+        return Ok(root.to_str().to_float().unwrap())
+    return Ok(min_into(root, 1e999))
 
 fn max_values(root: Json) -> Result[float, str]:
     if count_into(root) == 0:
         return Err("no numbers found")
-    return Ok(max_into(root, -1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0))
+    return Ok(max_into(root, -1e999))
 
 fn count_numbers(root: Json) -> int:
     return count_into(root)
 
 fn count_keys_total(root: Json) -> int:
-    let s = root.to_str()
-    if s.starts_with("{"):
+    if root.is_obj():
         let mut count = root.len()
         for k in root.keys():
             count = count + count_keys_total(root[k.to_str()])
         return count
-    if s.starts_with("["):
+    if root.is_arr():
         let mut count = 0
         let mut i = 0
         while i < root.len():
@@ -136,43 +120,39 @@ fn collect_tags(v: Json, dist: mut ref Dict[str, int]):
         dist.set(tag, dist[tag] + 1)
     else:
         dist.set(tag, 1)
-    let s = v.to_str()
-    if s.starts_with("{"):
+    if v.is_obj():
         for k in v.keys():
             collect_tags(v[k], dist)
-    else if s.starts_with("["):
+    else if v.is_arr():
         let mut i = 0
         while i < v.len():
             collect_tags(v[i], dist)
             i = i + 1
 
 fn tag_of(v: Json) -> str:
-    let s = v.to_str()
-    if s.starts_with("{"):
+    if v.is_obj():
         return "object"
-    if s.starts_with("["):
+    if v.is_arr():
         return "array"
-    if s == "true" or s == "false":
+    if v.is_bool():
         return "bool"
-    if s == "None":
+    if v.is_null():
         return "null"
-    if s.starts_with("\""):
+    if v.is_str():
         return "string"
-    let f = s.to_float()
-    if f.is_ok():
+    if v.is_num():
         return "number"
     return "string"
 
 fn depth_of(v: Json) -> int:
-    let s = v.to_str()
-    if s.starts_with("{"):
+    if v.is_obj():
         let mut max_depth = 0
         for k in v.keys():
             let d = depth_of(v[k])
             if d > max_depth:
                 max_depth = d
         return max_depth + 1
-    if s.starts_with("["):
+    if v.is_arr():
         let mut max_depth = 0
         let mut i = 0
         while i < v.len():

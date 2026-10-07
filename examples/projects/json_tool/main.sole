@@ -251,3 +251,5 @@ fn cmd_merge(a: str, b: str) -> int:
         return 1
     print(json_encode(m.unwrap()))
     return 0
+
+exit(main(args()))

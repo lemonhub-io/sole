@@ -6,10 +6,15 @@ fn main() -> ExitCode {
     let mut path: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut pos: Vec<String> = Vec::new();
+    let mut script_args: Vec<String> = Vec::new();
     let mut fmt_check = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--" => {
+                script_args.extend(args[i + 1..].iter().cloned());
+                break;
+            }
             "--lang" => {
                 let Some(value) = args.get(i + 1) else {
                     eprintln!("error: `--lang` requires a value (en | zh)");
@@ -49,8 +54,11 @@ fn main() -> ExitCode {
             }
             other => {
                 if path.is_some() && cmd.as_deref() != Some("fmt") {
-                    eprintln!("error: unexpected extra argument `{}`", other);
-                    return ExitCode::from(2);
+                    // Extra positionals after the file are script args
+                    // (`sole run a.sole x y` ⇢ `args()` = ["x", "y"]).
+                    script_args.push(other.to_string());
+                    i += 1;
+                    continue;
                 }
                 if path.is_none() {
                     path = Some(other.to_string());
@@ -110,7 +118,7 @@ fn main() -> ExitCode {
                     }
                 },
                 Some("fmt") => fmt_main(&pos, fmt_check),
-                _ => match sole::run_file(&path) {
+                _ => match sole::run_file_with_args(&path, &script_args) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(msg) => {
                         eprintln!("error: {}", msg);
@@ -125,7 +133,7 @@ fn main() -> ExitCode {
                 env!("CARGO_PKG_VERSION")
             );
             eprintln!("usage:");
-            eprintln!("  sole run [--lang en|zh] <file>    run a .sole script");
+            eprintln!("  sole run [--lang en|zh] <file> [args...]");
             eprintln!("  sole test [--lang en|zh] <file>   run the `test` blocks");
             eprintln!("  sole fmt [--check] <file|dir>...  format .sole files");
             eprintln!("  sole lsp                          start the LSP server");

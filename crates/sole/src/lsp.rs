@@ -1,9 +1,9 @@
 //! Minimal LSP server (GOALS §9.1): JSON-RPC 2.0 over stdio.
 //!
-//! Supports full-sync document updates, publishDiagnostics (reusing the
+//! Supports incremental document sync, publishDiagnostics (reusing the
 //! type checker, bilingual via sole-diag), go-to-definition for functions /
-//! types / top-level bindings, and basic completion. Hover and incremental
-//! sync are intentionally not implemented yet.
+//! types / top-level bindings, hover types (from the same checker run),
+//! and basic completion.
 
 use crate::typecheck;
 use sole_diag::Lang;
@@ -41,8 +41,9 @@ pub fn run_server() -> Result<(), String> {
             "initialize" => {
                 let result = serde_json::json!({
                     "capabilities": {
-                        "textDocumentSync": 1,
+                        "textDocumentSync": {"openClose": true, "change": 2},
                         "definitionProvider": true,
+                        "hoverProvider": true,
                         "completionProvider": {"triggerCharacters": ["."]},
                     },
                     "serverInfo": {"name": "sole-lsp", "version": env!("CARGO_PKG_VERSION")},
@@ -54,21 +55,38 @@ pub fn run_server() -> Result<(), String> {
                 shutdown = true;
             }
             "exit" => break,
-            "textDocument/didOpen" | "textDocument/didChange" => {
+            "textDocument/didOpen" => {
                 let uri = params.pointer("/textDocument/uri").and_then(|u| u.as_str());
-                // didOpen carries the text on textDocument; didChange carries
-                // it on contentChanges[0].text (full sync).
                 let text = params
                     .pointer("/textDocument/text")
-                    .or_else(|| params.pointer("/contentChanges/0/text"))
                     .and_then(|t| t.as_str());
                 if let (Some(uri), Some(text)) = (uri, text) {
                     docs.insert(uri.to_string(), text.to_string());
                     publish(&mut out, uri, &docs)?;
                 }
             }
+            "textDocument/didChange" => {
+                // Incremental sync: each contentChange either carries a
+                // `range` (applied to the stored text) or is a full
+                // replacement (clients that choose not to send deltas).
+                let uri = params.pointer("/textDocument/uri").and_then(|u| u.as_str());
+                if let Some(uri) = uri {
+                    let mut text = docs.get(uri).cloned().unwrap_or_default();
+                    if let Some(changes) = params.get("contentChanges").and_then(|c| c.as_array()) {
+                        for change in changes {
+                            apply_change(&mut text, change);
+                        }
+                    }
+                    docs.insert(uri.to_string(), text);
+                    publish(&mut out, uri, &docs)?;
+                }
+            }
             "textDocument/definition" => {
                 let result = definition(&params, &docs);
+                send(&mut out, id, &result)?;
+            }
+            "textDocument/hover" => {
+                let result = hover(&params, &docs);
                 send(&mut out, id, &result)?;
             }
             "textDocument/completion" => {
@@ -202,7 +220,7 @@ pub fn symbols_for(source: &str) -> SymbolTable {
                 for s in &then_block.stmts {
                     collect_stmt(s, symbols);
                 }
-                if let Some(ElseBranch::Block(b)) = else_block {
+                if let Some(ElseBranch::Block(b, _)) = else_block {
                     for s in &b.stmts {
                         collect_stmt(s, symbols);
                     }
@@ -238,6 +256,111 @@ pub fn symbols_for(source: &str) -> SymbolTable {
         }
     }
     symbols
+}
+
+/// Applies one `contentChange` to a document. A change with `range` edits
+/// that span; without `range` it replaces the whole document (the
+/// full-sync fallback some clients still send).
+fn apply_change(text: &mut String, change: &serde_json::Value) {
+    let Some(range) = change.get("range") else {
+        if let Some(t) = change.get("text").and_then(|t| t.as_str()) {
+            *text = t.to_string();
+        }
+        return;
+    };
+    let pos = |side: &str| -> Option<(usize, usize)> {
+        Some((
+            range
+                .pointer(&format!("/{}/line", side))
+                .and_then(|v| v.as_u64())? as usize,
+            range
+                .pointer(&format!("/{}/character", side))
+                .and_then(|v| v.as_u64())? as usize,
+        ))
+    };
+    let (Some((sl, sc)), Some((el, ec))) = (pos("start"), pos("end")) else {
+        return;
+    };
+    let (Some(start), Some(end)) = (pos_to_offset(text, sl, sc), pos_to_offset(text, el, ec))
+    else {
+        return;
+    };
+    if start > end {
+        return;
+    }
+    let new_text = change.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    text.replace_range(start..end, new_text);
+}
+
+/// Maps an LSP position (0-based line, UTF-16 code-unit column) to a byte
+/// offset. Positions past the end of a line clamp to the line end; a line
+/// past the end of the document yields `None` (the change is dropped).
+fn pos_to_offset(text: &str, line: usize, character: usize) -> Option<usize> {
+    let mut offset = 0usize;
+    for (i, l) in text.split('\n').enumerate() {
+        if i == line {
+            let mut units = 0usize;
+            for (bi, c) in l.char_indices() {
+                if units >= character {
+                    return Some(offset + bi);
+                }
+                units += c.len_utf16();
+            }
+            return Some(offset + l.len());
+        }
+        offset += l.len() + 1;
+    }
+    None
+}
+
+/// Symbol → hover text table (`fn f(a: int) -> bool`, `struct Point`,
+/// `x: int`). Reuses the type checker; parse errors yield an empty table.
+/// Name-keyed: the last binding of a name wins, matching `symbols_for`.
+pub fn types_for(source: &str) -> HashMap<String, String> {
+    let Ok(program) = parse(source) else {
+        return HashMap::new();
+    };
+    typecheck::check_symbols(&program).0
+}
+
+/// Handles `textDocument/hover`: type/signature under the cursor.
+pub fn hover(params: &serde_json::Value, docs: &Documents) -> serde_json::Value {
+    let Some(uri) = params.pointer("/textDocument/uri").and_then(|u| u.as_str()) else {
+        return serde_json::Value::Null;
+    };
+    let Some(position) = params.get("position") else {
+        return serde_json::Value::Null;
+    };
+    let line = position.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+    let character = position
+        .get("character")
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0) as usize;
+    let Some(source) = docs.get(uri) else {
+        return serde_json::Value::Null;
+    };
+    let Some(line_text) = source.lines().nth(line) else {
+        return serde_json::Value::Null;
+    };
+    let Some(name) = ident_at(line_text, character) else {
+        return serde_json::Value::Null;
+    };
+    let types = types_for(source);
+    let Some(text) = types.get(&name) else {
+        return serde_json::Value::Null;
+    };
+    // Functions/types store their full declaration; bindings show `x: ty`.
+    let is_decl = ["fn ", "struct ", "interface ", "test "]
+        .iter()
+        .any(|p| text.starts_with(p));
+    let value = if is_decl {
+        text.clone()
+    } else {
+        format!("{}: {}", name, text)
+    };
+    serde_json::json!({
+        "contents": {"kind": "markdown", "value": format!("```sole\n{}\n```", value)},
+    })
 }
 
 /// Extracts the identifier touching a 0-based position in a line.

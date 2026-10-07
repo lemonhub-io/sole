@@ -175,6 +175,81 @@ fn lsp_completion_includes_keywords_and_symbols() {
 }
 
 #[test]
+fn lsp_hover_shows_types() {
+    let mut lsp = Lsp::start();
+    lsp.initialize();
+    let src =
+        "fn add(a: int, b: int) -> int:\n    return a + b\nlet total = add(1, 2)\nprint(total)\n";
+    lsp.did_open("file:///hover.sole", src);
+    lsp.recv(); // diagnostics
+
+    // Hover over `total` in `print(total)`.
+    lsp.send(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "textDocument/hover",
+        "params": {"textDocument": {"uri": "file:///hover.sole"},
+                   "position": {"line": 3, "character": 8}},
+    }));
+    let r = lsp.recv();
+    let value = r["result"]["contents"]["value"].as_str().unwrap();
+    assert!(value.contains("total: int"), "hover: {value}");
+
+    // Hover over `add` in the call shows the signature.
+    lsp.send(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 6, "method": "textDocument/hover",
+        "params": {"textDocument": {"uri": "file:///hover.sole"},
+                   "position": {"line": 2, "character": 13}},
+    }));
+    let r = lsp.recv();
+    let value = r["result"]["contents"]["value"].as_str().unwrap();
+    assert!(
+        value.contains("fn add(a: int, b: int) -> int"),
+        "hover: {value}"
+    );
+    lsp.shutdown();
+}
+
+#[test]
+fn lsp_incremental_change_applies_range_edits() {
+    let mut lsp = Lsp::start();
+    lsp.initialize();
+    lsp.did_open("file:///inc.sole", "let x = 1\nprint(x)\n");
+    let r = lsp.recv();
+    assert!(r["params"]["diagnostics"].as_array().unwrap().is_empty());
+
+    // Ranged edit: replace `1` with `"s"` at (0,8)–(0,9) → type error if
+    // the doc really became `let x = "s"` and x is used... to force a
+    // diagnostic, instead replace `x` on line 1 with `nope`.
+    lsp.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": "file:///inc.sole"},
+            "contentChanges": [{
+                "range": {"start": {"line": 1, "character": 6},
+                          "end": {"line": 1, "character": 7}},
+                "text": "undefined_name",
+            }],
+        },
+    }));
+    let r = lsp.recv();
+    assert_eq!(r["method"], "textDocument/publishDiagnostics");
+    assert_eq!(r["params"]["diagnostics"][0]["code"], "E0201");
+
+    // A full-replacement change (no range) still works.
+    lsp.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": "file:///inc.sole"},
+            "contentChanges": [{"text": "print(1)\n"}],
+        },
+    }));
+    let r = lsp.recv();
+    assert!(r["params"]["diagnostics"].as_array().unwrap().is_empty());
+    lsp.shutdown();
+}
+
+#[test]
 fn lsp_diagnostics_update_after_change() {
     let mut lsp = Lsp::start();
     lsp.initialize();

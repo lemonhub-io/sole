@@ -52,13 +52,15 @@ Currently supported:
 - Concurrency primitives: coroutines (`go`), `task_group` (structured
   concurrency: scoped waiting + cancellation propagation), channels `Chan[T]`
   (`send`/`recv`/`close`, buffered/unbuffered, `for v in ch` receive loops, `yield`)
-- Formatter: the official canonical format (gofmt-like),
-  `sole fmt <file|dir>` / `sole fmt --check`
-- LSP server: `sole lsp` (full-sync diagnostics, go-to-definition,
-  completion; reuses the type checker with bilingual rendering)
+- Formatter: the official canonical format (gofmt-like, comments
+  preserved), `sole fmt <file|dir>` / `sole fmt --check`
+- LSP server: `sole lsp` (incremental-sync diagnostics, go-to-definition,
+  completion, hover; reuses the type checker with bilingual rendering)
+- Arbitrary-precision `int` (i64 fast path + automatic promotion on
+  overflow); `sole run f.sole -- args` + `args()`/`exit(code)` builtins
 - Mutability checking (`let mut` is required for reassignment); errors are
   located with line/column in lexing, parsing, and type checking; runtime
-  errors carry the line number (index out of range is E0223)
+  errors carry line and column (index out of range is E0223)
 - Bilingual error messages (`--lang en|zh` or the `SOLE_LANG` env var)
 
 ## Quick Start (on any machine with Rust)
@@ -89,8 +91,9 @@ command-line tool (multi-file modules + stdlib + 41 `test` cases):
 cargo run --bin sole -- test examples/projects/json_tool/main.sole
 ```
 
-Note: the CLI does not yet pass arguments to scripts — the demo drives
-`main(args)` from `sole test` blocks (deferred to M5).
+Note: `sole run file.sole -- arg1 arg2` passes arguments to scripts
+(read via the `args()` builtin); the in-repo demo still drives `main(args)`
+from `sole test` blocks.
 
 Error messages are English by default and carry stable error codes (e.g.
 `[E0201]`); switch to Chinese with `--lang zh` or the `SOLE_LANG=zh` env var.
@@ -106,7 +109,6 @@ cargo test --workspace
 
 ## Provisional / Not Yet Implemented
 
-- `int` is currently `i64` (the design goal is arbitrary precision, GOALS §4.1)
 - Integer division is truncating for now; truthiness is Python-style
   (provisional)
 - Borrow checking is the minimal rule set (variable-level and field-level
@@ -117,6 +119,4 @@ cargo test --workspace
   `for` iteration over custom types (builtin containers only)
 - `ref` / `mut ref` have full borrow checking, but no runtime borrow-escape
   detection (guaranteed statically)
-- The formatter discards comments (the lexer does not keep them); LSP hover
-  and incremental sync are not implemented (honestly recorded in D14)
 - Full technical debt inventory: [docs/DEBT.md](docs/DEBT.md)

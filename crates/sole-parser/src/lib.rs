@@ -206,7 +206,8 @@ impl Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ElseBranch {
     If(Box<Stmt>),
-    Block(Block),
+    /// The `Span` locates the `else` keyword itself.
+    Block(Block, Span),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -218,7 +219,9 @@ pub enum IterMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Int(i64, Span),
+    /// Arbitrary-precision integer literal (digit text, `_` separators
+    /// already stripped by the lexer).
+    Int(String, Span),
     Float(f64, Span),
     Str(String, Span),
     Bool(bool, Span),
@@ -743,6 +746,7 @@ impl<'a> Parser<'a> {
         self.expect_newline()?;
         let then_block = self.parse_block()?;
         let else_block = if self.at(&TokenKind::Else) {
+            let else_span = self.here_span();
             self.advance();
             if self.at(&TokenKind::If) {
                 Some(ElseBranch::If(Box::new(self.parse_if()?)))
@@ -750,7 +754,7 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::Colon, ":")?;
                 self.expect_newline()?;
                 let block = self.parse_block()?;
-                Some(ElseBranch::Block(block))
+                Some(ElseBranch::Block(block, else_span))
             }
         } else {
             None
@@ -1065,6 +1069,7 @@ impl<'a> Parser<'a> {
         match self.peek_kind() {
             Some(TokenKind::Int(n)) => {
                 let span = self.here_span();
+                let n = n.clone();
                 self.advance();
                 Ok(Expr::Int(n, span))
             }
